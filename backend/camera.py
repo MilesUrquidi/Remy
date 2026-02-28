@@ -53,7 +53,7 @@ SILENCE_DURATION   = 0.8   # seconds of silence that marks end of utterance
 MIN_SPEECH_SECONDS = 0.5   # discard clips shorter than this (noise/clicks)
 
 # Periodic video analysis
-VIDEO_INTERVAL = 3.0  # seconds between video-only GPT snapshots
+VIDEO_INTERVAL = 1  # seconds between video-only GPT snapshots
 
 
 # Updated by set_current_step() as the user progresses through a recipe
@@ -209,12 +209,10 @@ def gpt_worker(system_prompt=None):
 
         # Print a clean label so it's easy to read during testing
         if not remember:
-            # Video step-check
             label = CURRENT_STEP_LABEL or "general observation"
             print(f"\n[Step Check] '{label}'")
             print(f"[AI] ", end="", flush=True)
         else:
-            # Speech query
             print(f"\n[You said] '{text}'")
             print(f"[AI] ", end="", flush=True)
 
@@ -223,7 +221,7 @@ def gpt_worker(system_prompt=None):
                 text, frame=frame, system_prompt=system_prompt, stream=True, remember=remember
             ):
                 print(chunk, end="", flush=True)
-            print()  # newline after streamed response
+            print()
         except Exception as e:
             print(f"[GPT] Error: {e}")
 
