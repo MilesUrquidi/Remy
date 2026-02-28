@@ -5,11 +5,13 @@ load_dotenv()
 
 client = OpenAI()
 
-response = client.chat.completions.create(
-    model="gpt-4.1-mini",
-    messages=[
-        {"role": "user", "content": "Write a one-sentence bedtime story about a unicorn."}
-    ]
-)
+def ai_text_output(prompt):
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+    print(response.choices[0].message.content)
 
-print(response.choices[0].message.content)
+ai_text_output('hi, tell me a sentence about yourself')
