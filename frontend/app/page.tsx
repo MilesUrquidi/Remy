@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 
 // Palette
 // #2C5F2E — deep forest green (primary)
@@ -8,26 +8,21 @@ import { useState } from "react";
 // #FFF8F0 — warm white (background)
 // #D4A017 — golden mustard (accent / CTA)
 
-type Step = {
-  title: string;
-  description: string;
+const BACKEND_URL = "http://localhost:8000";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type StepCheckData = {
+  completed: boolean;
+  state: { completed: boolean; explanation: string };
+  action: { completed: boolean; explanation: string };
 };
 
-const MOCK_STEPS: Step[] = [
-  { title: "Gather your ingredients", description: "Get everything out before you start — butter, garlic, pasta, parmesan, and eggs." },
-  { title: "Boil the pasta", description: "Salt your water generously — it should taste like the sea. Cook pasta to al dente." },
-  { title: "Make the sauce", description: "Whisk eggs and parmesan together off the heat. Add pasta water slowly to temper." },
-  { title: "Combine", description: "Toss hot pasta with the egg mixture quickly — the heat cooks the eggs without scrambling." },
-  { title: "Plate and serve", description: "Twirl into a bowl, crack black pepper generously, and top with extra parmesan." },
-];
-
-const MOCK_REMY_SAYS = [
-  "I can see your ingredients laid out — looks good! Make sure your eggs are room temperature before we start.",
-  "Your water is boiling nicely. Don't forget the salt — a good handful, not a pinch!",
-  "Whisk those eggs vigorously. You want a smooth, pale yellow mixture before adding the cheese.",
-  "Work fast here! The pasta needs to be steaming hot when it hits the egg mixture.",
-  "Beautiful! A little more pepper never hurt anyone. Serve immediately while it's hot.",
-];
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const LOADING_MESSAGES = [
   "Checking your pantry…",
@@ -37,15 +32,6 @@ const LOADING_MESSAGES = [
   "Getting ready to cook…",
 ];
 
-// Mock recipe preview data (shown after URL is pasted)
-const MOCK_RECIPE_PREVIEW = {
-  name: "Spaghetti Carbonara",
-  source: "cooking.nytimes.com",
-  time: "30 min",
-  servings: "4 servings",
-  steps: 5,
-};
-
 function isValidUrl(str: string) {
   try {
     const url = new URL(str);
@@ -54,6 +40,10 @@ function isValidUrl(str: string) {
     return false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 
 export default function Home() {
   const [phase, setPhase] = useState<"prompt" | "loading" | "coaching">("prompt");
@@ -68,6 +58,68 @@ export default function Home() {
   const [displayStep, setDisplayStep] = useState(0);
   const [loadingMsg, setLoadingMsg] = useState(LOADING_MESSAGES[0]);
 
+  // ── Real data from backend ─────────────────────────────────────
+  const [steps, setSteps] = useState<string[]>([]);
+  const [stepDetails, setStepDetails] = useState<Record<string, string>>({});
+  const [remySpeech, setRemySpeech] = useState<string>("");
+  const [stepCompleted, setStepCompleted] = useState(false);
+  const [stepCheckData, setStepCheckData] = useState<StepCheckData | null>(null);
+  const [apiError, setApiError] = useState<string | null>(null);
+
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  // Cleanup SSE on unmount
+  useEffect(() => {
+    return () => { eventSourceRef.current?.close(); };
+  }, []);
+
+  // ── SSE connection ─────────────────────────────────────────────
+
+  function connectSSE() {
+    eventSourceRef.current?.close();
+    const es = new EventSource(`${BACKEND_URL}/stream`);
+
+    es.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === "step_check") {
+          const data = msg.data;
+          if (data && typeof data === "object") {
+            setStepCheckData(data as StepCheckData);
+            if (data.completed) setStepCompleted(true);
+          }
+        } else if (msg.type === "speech") {
+          setRemySpeech(msg.data as string);
+        }
+      } catch {
+        // ignore malformed frames
+      }
+    };
+
+    es.onerror = () => {
+      // EventSource auto-reconnects; silently suppress
+    };
+
+    eventSourceRef.current = es;
+  }
+
+  // ── Step details (optional, background fetch) ──────────────────
+
+  async function loadStepDetails(step: string) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/step/details?step=${encodeURIComponent(step)}`);
+      const data = await res.json();
+      if (data.details) {
+        setStepDetails(prev => ({ ...prev, [step]: data.details }));
+      }
+    } catch {
+      // optional — fine to fail silently
+    }
+  }
+
+  // ── Navigation helpers ─────────────────────────────────────────
+
   function crossFadeTo(nextPhase: "prompt" | "loading" | "coaching") {
     setPhase(nextPhase);
   }
@@ -78,10 +130,7 @@ export default function Home() {
     setUrlParsing(false);
     if (isValidUrl(val.trim())) {
       setUrlParsing(true);
-      setTimeout(() => {
-        setUrlParsing(false);
-        setUrlParsed(true);
-      }, 1200);
+      setTimeout(() => { setUrlParsing(false); setUrlParsed(true); }, 1200);
     }
   }
 
@@ -96,53 +145,113 @@ export default function Home() {
     return urlParsed;
   }
 
-  function handleStart() {
+  // ── Start — calls backend, then connects SSE ───────────────────
+
+  async function handleStart() {
     if (!canStart()) return;
+    setApiError(null);
     crossFadeTo("loading");
+
     let i = 0;
     const interval = setInterval(() => {
       i = (i + 1) % LOADING_MESSAGES.length;
       setLoadingMsg(LOADING_MESSAGES[i]);
     }, 800);
-    setTimeout(() => {
+
+    try {
+      const food = inputMode === "describe" ? prompt.trim() : recipeUrl.trim();
+
+      // 1. Generate recipe steps
+      const genRes = await fetch(`${BACKEND_URL}/recipe/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ food }),
+      });
+      if (!genRes.ok) throw new Error(`Recipe generation failed (${genRes.status})`);
+      const genData = await genRes.json();
+      const newSteps: string[] = genData.steps;
+      setSteps(newSteps);
+
+      // 2. Start camera + AI pipeline
+      await fetch(`${BACKEND_URL}/camera/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+
+      // 3. Set first step
+      await fetch(`${BACKEND_URL}/recipe/set-step`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ step: newSteps[0] }),
+      });
+
+      // 4. Open SSE stream
+      connectSSE();
+
       clearInterval(interval);
+      setCurrentStep(0);
+      setDisplayStep(0);
+      setStepCompleted(false);
+      setStepCheckData(null);
+      setRemySpeech("");
       crossFadeTo("coaching");
-    }, 2500);
+
+      // 5. Load first step details in background
+      loadStepDetails(newSteps[0]);
+
+    } catch (err) {
+      clearInterval(interval);
+      const msg = err instanceof Error ? err.message : "Something went wrong";
+      setApiError(`${msg} — is the backend running on port 8000?`);
+      crossFadeTo("prompt");
+    }
   }
 
-  function handleNext() {
+  // ── Advance step ───────────────────────────────────────────────
+
+  async function handleNext() {
     if (animating) return;
-    if (currentStep >= MOCK_STEPS.length - 1) {
+    const nextIdx = currentStep + 1;
+
+    if (nextIdx >= steps.length) {
+      eventSourceRef.current?.close();
+      try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch {}
       setDone(true);
       return;
     }
+
     setAnimating(true);
-    const next = currentStep + 1;
-    setCurrentStep(next);
+    setStepCompleted(false);
+    setStepCheckData(null);
+
+    try {
+      await fetch(`${BACKEND_URL}/recipe/set-step`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ step: steps[nextIdx] }),
+      });
+    } catch {}
+
+    setCurrentStep(nextIdx);
     setTimeout(() => {
-      setDisplayStep(next);
+      setDisplayStep(nextIdx);
       setAnimating(false);
+      loadStepDetails(steps[nextIdx]);
     }, 400);
   }
 
   // ── PROMPT SCREEN ──────────────────────────────────────────────
+
   if (phase === "prompt") {
     return (
-      <div
-        className="relative flex h-screen w-screen overflow-hidden"
-        style={{ background: "#FFF8F0" }}
-      >
+      <div className="relative flex h-screen w-screen overflow-hidden" style={{ background: "#FFF8F0" }}>
         <style>{`
           @keyframes tabSlide {
             from { opacity: 0; transform: translateY(8px); }
             to   { opacity: 1; transform: translateY(0); }
           }
           .tab-content { animation: tabSlide 0.2s ease forwards; }
-          @keyframes previewIn {
-            from { opacity: 0; transform: translateY(6px); }
-            to   { opacity: 1; transform: translateY(0); }
-          }
-          .preview-in { animation: previewIn 0.3s ease forwards; }
           @keyframes spin { to { transform: rotate(360deg); } }
           .spinner { animation: spin 0.8s linear infinite; }
         `}</style>
@@ -150,6 +259,8 @@ export default function Home() {
         <CameraPip />
 
         <div className="flex-1 flex flex-col items-center justify-center gap-7 px-12">
+
+          {/* Brand */}
           <div className="w-full max-w-lg flex flex-col items-center gap-2 text-center">
             <div className="flex items-center gap-3 mb-1">
               <span className="text-5xl">🐀</span>
@@ -158,36 +269,37 @@ export default function Home() {
             <p className="text-base font-medium" style={{ color: "#97BC62" }}>your AI sous chef</p>
             <div className="w-12 h-0.5 rounded-full my-2" style={{ background: "#D4A017" }} />
             <h1 className="text-2xl font-semibold" style={{ color: "#3a3a2a" }}>What are we cooking?</h1>
-            <p className="text-sm" style={{ color: "#97BC62" }}>Tell Remy what you want to make, or paste a recipe link — he'll guide you through it hands-free.</p>
+            <p className="text-sm" style={{ color: "#97BC62" }}>
+              Tell Remy what you want to make — he'll guide you through it hands-free.
+            </p>
           </div>
 
-          {/* Mode toggle tabs */}
+          {/* Error banner */}
+          {apiError && (
+            <div className="w-full max-w-lg rounded-xl px-4 py-3 text-sm" style={{ background: "#fee2e2", color: "#dc2626", border: "1px solid #fca5a5" }}>
+              ⚠️ {apiError}
+            </div>
+          )}
+
+          {/* Mode toggle */}
           <div className="w-full max-w-lg flex rounded-2xl p-1 gap-1" style={{ background: "#e8e0d8" }}>
-            <button
-              onClick={() => switchMode("describe")}
-              className="flex-1 rounded-xl py-2 text-sm font-semibold transition-all"
-              style={{
-                background: inputMode === "describe" ? "#fff" : "transparent",
-                color: inputMode === "describe" ? "#2C5F2E" : "#97BC62",
-                boxShadow: inputMode === "describe" ? "0 1px 4px #0001" : "none",
-              }}
-            >
-              ✏️  Describe a dish
-            </button>
-            <button
-              onClick={() => switchMode("url")}
-              className="flex-1 rounded-xl py-2 text-sm font-semibold transition-all"
-              style={{
-                background: inputMode === "url" ? "#fff" : "transparent",
-                color: inputMode === "url" ? "#2C5F2E" : "#97BC62",
-                boxShadow: inputMode === "url" ? "0 1px 4px #0001" : "none",
-              }}
-            >
-              🔗  Paste a recipe URL
-            </button>
+            {(["describe", "url"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => switchMode(mode)}
+                className="flex-1 rounded-xl py-2 text-sm font-semibold transition-all"
+                style={{
+                  background: inputMode === mode ? "#fff" : "transparent",
+                  color: inputMode === mode ? "#2C5F2E" : "#97BC62",
+                  boxShadow: inputMode === mode ? "0 1px 4px #0001" : "none",
+                }}
+              >
+                {mode === "describe" ? "✏️  Describe a dish" : "🔗  Paste a recipe URL"}
+              </button>
+            ))}
           </div>
 
-          {/* Input area */}
+          {/* Input */}
           <div className="w-full max-w-lg tab-content" key={inputMode}>
             {inputMode === "describe" ? (
               <textarea
@@ -206,7 +318,8 @@ export default function Home() {
                   style={{ background: "#fff", border: `1.5px solid ${urlParsed ? "#2C5F2E" : "#97BC62"}` }}
                 >
                   <svg className="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="#97BC62" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M10.172 13.828a4 4 0 015.656 0l4 4a4 4 0 01-5.656 5.656l-1.102-1.101" />
                   </svg>
                   <input
                     autoFocus
@@ -228,34 +341,14 @@ export default function Home() {
                     </svg>
                   )}
                 </div>
-
-                {urlParsed && (
-                  <div className="preview-in rounded-2xl p-4 flex gap-4 items-center" style={{ background: "#2C5F2E0D", border: "1.5px solid #2C5F2E30" }}>
-                    <div className="rounded-xl shrink-0 flex items-center justify-center text-2xl" style={{ width: 56, height: 56, background: "#97BC6240" }}>
-                      🍝
-                    </div>
-                    <div className="flex flex-col gap-0.5 flex-1 min-w-0">
-                      <span className="font-semibold text-base truncate" style={{ color: "#2C5F2E" }}>{MOCK_RECIPE_PREVIEW.name}</span>
-                      <span className="text-xs truncate" style={{ color: "#97BC62" }}>{MOCK_RECIPE_PREVIEW.source}</span>
-                      <div className="flex items-center gap-3 mt-1">
-                        <span className="text-xs" style={{ color: "#5a5a4a" }}>⏱ {MOCK_RECIPE_PREVIEW.time}</span>
-                        <span className="text-xs" style={{ color: "#5a5a4a" }}>👥 {MOCK_RECIPE_PREVIEW.servings}</span>
-                        <span className="text-xs" style={{ color: "#5a5a4a" }}>📋 {MOCK_RECIPE_PREVIEW.steps} steps</span>
-                      </div>
-                    </div>
-                    <button onClick={() => { setRecipeUrl(""); setUrlParsed(false); }} className="shrink-0 text-xs underline" style={{ color: "#97BC62" }}>
-                      Change
-                    </button>
-                  </div>
-                )}
-
-                {!urlParsed && !urlParsing && (
+                {urlParsed ? (
+                  <p className="text-xs text-center" style={{ color: "#2C5F2E" }}>✓ URL ready — click Let&apos;s Cook to start</p>
+                ) : urlParsing ? (
+                  <p className="text-xs text-center" style={{ color: "#97BC62" }}>Reading recipe…</p>
+                ) : (
                   <p className="text-xs text-center" style={{ color: "#b0a898" }}>
                     Works with AllRecipes, NYT Cooking, Serious Eats, Food Network & more
                   </p>
-                )}
-                {urlParsing && (
-                  <p className="text-xs text-center" style={{ color: "#97BC62" }}>Reading recipe…</p>
                 )}
               </div>
             )}
@@ -267,7 +360,7 @@ export default function Home() {
             className="w-full max-w-lg rounded-2xl py-3 text-base font-semibold transition-all disabled:opacity-30 disabled:cursor-not-allowed hover:brightness-110 active:scale-[0.98]"
             style={{ background: "#D4A017", color: "#fff" }}
           >
-            {inputMode === "url" && urlParsed ? `Cook "${MOCK_RECIPE_PREVIEW.name}" →` : "Let's Cook →"}
+            Let&apos;s Cook →
           </button>
         </div>
       </div>
@@ -275,6 +368,7 @@ export default function Home() {
   }
 
   // ── LOADING SCREEN ─────────────────────────────────────────────
+
   if (phase === "loading") {
     return (
       <div className="relative flex h-screen w-screen overflow-hidden" style={{ background: "#FFF8F0" }}>
@@ -311,6 +405,7 @@ export default function Home() {
   }
 
   // ── COMPLETION SCREEN ──────────────────────────────────────────
+
   if (done) {
     return (
       <div className="relative flex h-screen w-screen overflow-hidden" style={{ background: "#FFF8F0" }}>
@@ -327,7 +422,14 @@ export default function Home() {
           <h2 className="text-4xl font-bold text-center" style={{ color: "#2C5F2E" }}>Bon appétit!</h2>
           <p className="text-lg text-center max-w-md" style={{ color: "#5a5a4a" }}>You nailed it. Remy is proud of you.</p>
           <button
-            onClick={() => { setPrompt(""); setRecipeUrl(""); setUrlParsed(false); setCurrentStep(0); setDisplayStep(0); setDone(false); crossFadeTo("prompt"); }}
+            onClick={() => {
+              eventSourceRef.current?.close();
+              setPrompt(""); setRecipeUrl(""); setUrlParsed(false);
+              setCurrentStep(0); setDisplayStep(0); setDone(false);
+              setSteps([]); setStepDetails({}); setRemySpeech("");
+              setStepCompleted(false); setStepCheckData(null);
+              crossFadeTo("prompt");
+            }}
             className="mt-4 rounded-2xl px-8 py-3 text-sm font-medium transition-all hover:brightness-110"
             style={{ background: "#97BC62", color: "#2C5F2E" }}
           >
@@ -339,8 +441,9 @@ export default function Home() {
   }
 
   // ── COACHING SCREEN ────────────────────────────────────────────
-  const step = MOCK_STEPS[displayStep];
-  const remySays = MOCK_REMY_SAYS[displayStep];
+
+  const currentStepLabel = steps[displayStep] ?? "";
+  const currentStepDetail = stepDetails[currentStepLabel];
 
   return (
     <>
@@ -351,20 +454,27 @@ export default function Home() {
         }
         .step-in { animation: stepIn 0.35s ease forwards; }
         .wave-bar { transform-origin: bottom; display: inline-block; width: 3px; border-radius: 2px; background: #D4A017; }
+        @keyframes completedPulse {
+          0%, 100% { box-shadow: 0 0 0 0 #2C5F2E55; }
+          50%       { box-shadow: 0 0 0 6px #2C5F2E00; }
+        }
+        .completed-badge { animation: completedPulse 1.8s ease-in-out infinite; }
       `}</style>
 
       <div className="relative flex h-screen w-screen overflow-hidden" style={{ background: "#FFF8F0" }}>
         <CameraPip position="right-center" />
 
         <div className="flex-1 flex flex-col">
+
           {/* Header */}
           <div className="pt-7 pb-0 flex flex-col items-center gap-2">
             <div className="flex items-center gap-2">
               <span className="text-2xl">🐀</span>
               <span className="text-3xl font-bold tracking-tight" style={{ color: "#2C5F2E" }}>Remy</span>
             </div>
+            {/* Step progress dots */}
             <div className="flex items-center gap-2">
-              {MOCK_STEPS.map((_, i) => (
+              {steps.map((_, i) => (
                 <div
                   key={i}
                   className="rounded-full transition-all duration-500"
@@ -381,23 +491,70 @@ export default function Home() {
           {/* Step content */}
           <div key={displayStep} className="step-in flex-1 flex flex-col">
             <div className="flex-1 flex flex-col justify-center px-16 gap-4" style={{ maxWidth: "55%" }}>
-              <span className="text-xs uppercase tracking-widest font-semibold" style={{ color: "#97BC62" }}>
-                Step {displayStep + 1} of {MOCK_STEPS.length}
-              </span>
-              <h2 className="text-6xl font-bold leading-tight" style={{ color: "#3a3a2a" }}>
-                {step.title}
+
+              {/* Step label + status badge */}
+              <div className="flex items-center gap-3 flex-wrap">
+                <span className="text-xs uppercase tracking-widest font-semibold" style={{ color: "#97BC62" }}>
+                  Step {displayStep + 1} of {steps.length}
+                </span>
+
+                {stepCompleted && (
+                  <span
+                    className="completed-badge text-xs font-semibold px-2.5 py-1 rounded-full flex items-center gap-1"
+                    style={{ background: "#2C5F2E15", color: "#2C5F2E", border: "1.5px solid #2C5F2E50" }}
+                  >
+                    ✓ Step complete!
+                  </span>
+                )}
+
+                {stepCheckData && !stepCompleted && (
+                  <span
+                    className="text-xs font-medium px-2.5 py-1 rounded-full"
+                    style={{ background: "#D4A01715", color: "#D4A017", border: "1.5px solid #D4A01740" }}
+                  >
+                    👁 Watching…
+                  </span>
+                )}
+              </div>
+
+              {/* Step title */}
+              <h2 className="text-5xl font-bold leading-tight" style={{ color: "#3a3a2a" }}>
+                {currentStepLabel}
               </h2>
-              <p className="text-2xl leading-relaxed" style={{ color: "#5a5a4a" }}>
-                {step.description}
-              </p>
+
+              {/* Step how-to detail (loaded from /step/details) */}
+              {currentStepDetail && (
+                <p className="text-xl leading-relaxed" style={{ color: "#5a5a4a" }}>
+                  {currentStepDetail}
+                </p>
+              )}
+
+              {/* Live AI vision feedback */}
+              {stepCheckData && (
+                <div className="flex flex-col gap-1 mt-1">
+                  {stepCheckData.state?.explanation && (
+                    <p className="text-sm" style={{ color: "#7a9a5a" }}>
+                      <span className="font-semibold">State:</span> {stepCheckData.state.explanation}
+                    </p>
+                  )}
+                  {stepCheckData.action?.explanation &&
+                    stepCheckData.action.explanation !== stepCheckData.state?.explanation && (
+                    <p className="text-sm" style={{ color: "#7a9a5a" }}>
+                      <span className="font-semibold">Action:</span> {stepCheckData.action.explanation}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
 
-            {/* Remy says */}
+            {/* Remy says — speech responses */}
             <div className="mx-16 mb-6 rounded-2xl p-4 flex gap-3 items-start" style={{ background: "#2C5F2E15", border: "1px solid #2C5F2E30" }}>
               <span className="text-xl mt-0.5">🐀</span>
               <div className="flex flex-col gap-1 flex-1">
                 <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: "#2C5F2E" }}>Remy says</span>
-                <p className="text-sm leading-relaxed" style={{ color: "#3a3a2a" }}>{remySays}</p>
+                <p className="text-sm leading-relaxed" style={{ color: "#3a3a2a" }}>
+                  {remySpeech || "Listening and watching… ask me anything about this step!"}
+                </p>
               </div>
               <div className="ml-auto flex flex-col items-end gap-1.5 shrink-0 mt-1">
                 <Waveform />
@@ -405,33 +562,44 @@ export default function Home() {
               </div>
             </div>
 
-            {displayStep < MOCK_STEPS.length - 1 && (
+            {/* Up next */}
+            {displayStep < steps.length - 1 && (
               <div className="px-16 pb-4 flex items-center gap-3">
                 <span className="text-xs uppercase tracking-widest font-medium shrink-0" style={{ color: "#97BC62" }}>Up next</span>
                 <span className="text-sm truncate" style={{ color: "#97BC62" }}>
-                  {MOCK_STEPS[displayStep + 1].title}
+                  {steps[displayStep + 1]}
                 </span>
               </div>
             )}
           </div>
 
+          {/* CTA button */}
           <div className="px-16 pb-8">
             <button
               onClick={handleNext}
               disabled={animating}
               className="w-full rounded-2xl py-4 text-lg font-semibold transition-all hover:brightness-110 active:scale-[0.98] disabled:opacity-50"
-              style={{ background: "#D4A017", color: "#fff" }}
+              style={{
+                background: stepCompleted ? "#2C5F2E" : "#D4A017",
+                color: "#fff",
+                transition: "background 0.4s ease",
+              }}
             >
-              {currentStep < MOCK_STEPS.length - 1 ? "✓  Step Done — Next" : "✓  Complete"}
+              {currentStep < steps.length - 1
+                ? stepCompleted ? "✓  Step Done — Next →" : "Mark Done — Next →"
+                : stepCompleted ? "✓  Finish!" : "Mark Complete"}
             </button>
           </div>
+
         </div>
       </div>
     </>
   );
 }
 
-// ── Waveform visualizer ────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Waveform visualizer
+// ---------------------------------------------------------------------------
 
 function Waveform() {
   const bars = [0.4, 0.7, 1.0, 0.6, 0.9, 0.5, 0.8, 0.4, 0.7, 1.0, 0.6, 0.5];
@@ -453,12 +621,13 @@ function Waveform() {
   );
 }
 
-// ── Camera PiP ────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Camera PiP
+// ---------------------------------------------------------------------------
 
 function CameraPip({ position }: { position?: "top-left" | "right-center" }) {
   const isRight = position === "right-center";
-  // Swap to true when a real stream is connected
-  const connected = false;
+  const connected = false; // swap to true when real stream is connected
 
   return (
     <div
@@ -476,7 +645,6 @@ function CameraPip({ position }: { position?: "top-left" | "right-center" }) {
       }}
     >
       {connected ? (
-        /* replace with <video> tag when backend is ready */
         <div className="w-full h-full" style={{ background: "#97BC6240" }} />
       ) : (
         <div className="w-full h-full flex flex-col items-center justify-center gap-2">

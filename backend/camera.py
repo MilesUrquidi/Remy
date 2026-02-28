@@ -82,10 +82,11 @@ def set_current_step(step: str):
     )
 
 
-audio_queue        = queue.Queue()
+audio_queue         = queue.Queue()
 transcription_queue = queue.Queue()  # raw audio buffers ready to transcribe
-gpt_input_queue    = queue.Queue()   # (text, frame) pairs ready for GPT
-audio_running      = threading.Event()
+gpt_input_queue     = queue.Queue()  # (text, frame, remember) tuples ready for GPT
+results_queue       = queue.Queue()  # parsed AI results pushed to SSE stream
+audio_running       = threading.Event()
 
 # Shared latest video frame — updated every frame by the main loop
 latest_frame      = None
@@ -201,6 +202,8 @@ def video_worker():
 
 def gpt_worker(system_prompt=None):
     """Pull (text, frame, remember) tuples from gpt_input_queue and send to GPT-4o."""
+    import json
+
     while audio_running.is_set() or not gpt_input_queue.empty():
         try:
             text, frame, remember = gpt_input_queue.get(timeout=1)
@@ -217,11 +220,36 @@ def gpt_worker(system_prompt=None):
             print(f"[AI] ", end="", flush=True)
 
         try:
+            chunks = []
             for chunk in ai_vision_audio_query(
                 text, frame=frame, system_prompt=system_prompt, stream=True, remember=remember
             ):
                 print(chunk, end="", flush=True)
+                chunks.append(chunk)
             print()
+
+            full = "".join(chunks)
+
+            # Push result to SSE queue for the frontend
+            if not remember:
+                # Step check — try to parse as JSON
+                try:
+                    data = json.loads(full)
+                except json.JSONDecodeError:
+                    data = full
+                results_queue.put({
+                    "type": "step_check",
+                    "step": CURRENT_STEP_LABEL,
+                    "data": data,
+                })
+            else:
+                # Speech response
+                results_queue.put({
+                    "type": "speech",
+                    "step": CURRENT_STEP_LABEL,
+                    "data": full,
+                })
+
         except Exception as e:
             print(f"[GPT] Error: {e}")
 
