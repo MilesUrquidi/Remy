@@ -54,7 +54,10 @@ MIN_SPEECH_SECONDS = 0.5   # discard clips shorter than this (noise/clicks)
 
 # Periodic video analysis
 VIDEO_INTERVAL = 3.0  # seconds between video-only GPT snapshots
-VIDEO_PROMPT   = "Briefly analyze what is in the image. Is the user completing the task of pointing his index finger?"
+
+
+# IMPORTANT
+VIDEO_PROMPT   = "Briefly analyze what is in the image. Is the user completing the task of pointing his index finger?" 
 
 audio_queue        = queue.Queue()
 transcription_queue = queue.Queue()  # raw audio buffers ready to transcribe
