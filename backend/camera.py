@@ -57,7 +57,7 @@ VIDEO_INTERVAL = 3.0  # seconds between video-only GPT snapshots
 
 
 # IMPORTANT
-VIDEO_PROMPT   = "Briefly analyze what is in the image. Is the user completing the task of pointing his index finger?" 
+VIDEO_PROMPT  = "In one short sentence, is the user pointing their index finger? Answer yes or no and state what you see."
 
 audio_queue        = queue.Queue()
 transcription_queue = queue.Queue()  # raw audio buffers ready to transcribe
