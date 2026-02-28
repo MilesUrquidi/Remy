@@ -1,97 +1,120 @@
-import os
-import re
-import subprocess
-import sounddevice as sd
-import numpy as np
-import io
-import wave
+import tempfile
+from icrawler.builtin import BingImageCrawler
+from icrawler import ImageDownloader
 from openai import OpenAI
 from dotenv import load_dotenv
-from icrawler.builtin import BingImageCrawler
 
 load_dotenv()
 client = OpenAI()
 
-SAMPLE_RATE = 16000
-SILENCE_THRESHOLD = 0.02
-SILENCE_DURATION = 1.0
+
+# --- Image URL capture (no download) ---
+
+class _URLOnlyDownloader(ImageDownloader):
+    """Hooks into icrawler to capture the first image URL without saving anything."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.captured_url = None
+
+    def download(self, task, default_ext, timeout=None, max_retry=3, overwrite=False, **kwargs):
+        if self.captured_url is None:
+            self.captured_url = task.get("file_url")
 
 
-def show_help(term: str):
-    """Get a simple description and show a real image of the term."""
+def _get_image_url(query: str) -> str | None:
+    with tempfile.TemporaryDirectory() as tmp:
+        crawler = BingImageCrawler(
+            downloader_cls=_URLOnlyDownloader,
+            storage={"root_dir": tmp},
+            downloader_threads=1,
+        )
+        crawler.crawl(keyword=query, max_num=1)
+        return crawler.downloader.captured_url
+
+
+# --- Step context ---
+
+_DETAILS_SYSTEM = """You are a cooking assistant. Given a recipe step, describe ONLY the key action in one sentence.
+Focus on the technique or motion — skip setup instructions and ingredient prep.
+
+Examples:
+Step: "Matcha and water are whisked until frothy"
+→ Use a bamboo whisk (chasen) in a brisk zigzag motion until the mixture is smooth and frothy with a layer of bubbles on the surface.
+
+Step: "Peanut butter is spread across one slice"
+→ Use a butter knife to spread a generous, even layer of peanut butter across one slice of bread, reaching the edges.
+
+Step: "Drink is stirred with a spoon"
+→ Use a long spoon to stir from the bottom up a few times until the layers are evenly mixed."""
+
+
+def get_step_details(step: str) -> dict:
+    """
+    Returns a brief one-sentence explanation of how to perform the step.
+
+    Args:
+        step: A single recipe step string.
+
+    Returns:
+        {"step": str, "details": str}
+    """
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "Explain this in 2 simple sentences for a beginner. No jargon."},
-            {"role": "user", "content": f"What is a {term}?"}
-        ]
+            {"role": "system", "content": _DETAILS_SYSTEM},
+            {"role": "user", "content": f"Step: {step}"},
+        ],
+        temperature=0.3,
     )
-    print(f"\n{response.choices[0].message.content.strip()}\n")
-
-    save_dir = f"/tmp/{term.replace(' ', '_')}"
-    os.makedirs(save_dir, exist_ok=True)
-    BingImageCrawler(storage={"root_dir": save_dir}).crawl(keyword=term, max_num=1)
-
-    for file in os.listdir(save_dir):
-        subprocess.Popen(["open", os.path.join(save_dir, file)])
-        return
+    return {
+        "step": step,
+        "details": response.choices[0].message.content.strip(),
+    }
 
 
-def listen_and_detect():
-    """Continuously listen for 'what is X' phrases and trigger show_help."""
-    print("🎙️  Context help is listening... (say 'what is a [thing]' anytime)\n")
+def get_step_image(step: str) -> dict:
+    """
+    Returns an image URL showing what the completed state of the step looks like.
 
-    while True:
-        # Record until silence
-        audio_chunks = []
-        silence_count = 0
-        speaking = False
-        silence_limit = int(SAMPLE_RATE * SILENCE_DURATION / 1024)
+    Args:
+        step: A single recipe step string.
 
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, blocksize=1024) as stream:
-            while True:
-                chunk, _ = stream.read(1024)
-                rms = float(np.sqrt(np.mean(chunk ** 2)))
+    Returns:
+        {"step": str, "image_url": str | None}
+    """
+    # Ask GPT for a precise search query describing the completed state
+    query_response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Given a recipe step, return a short image search query (5 words max) "
+                    "that finds a photo of what the result looks like after the step is complete. "
+                    "Return only the search query, nothing else."
+                ),
+            },
+            {"role": "user", "content": f"Step: {step}"},
+        ],
+        temperature=0.3,
+    )
+    query = query_response.choices[0].message.content.strip()
+    image_url = _get_image_url(query)
 
-                if rms > SILENCE_THRESHOLD:
-                    speaking = True
-                    silence_count = 0
-                    audio_chunks.append(chunk)
-                elif speaking:
-                    audio_chunks.append(chunk)
-                    silence_count += 1
-                    if silence_count >= silence_limit:
-                        break
-
-        if not audio_chunks:
-            continue
-
-        # Transcribe with Whisper
-        audio_data = np.concatenate(audio_chunks)
-        pcm = (audio_data * 32767).astype(np.int16)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(pcm.tobytes())
-        buf.seek(0)
-
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("audio.wav", buf, "audio/wav"),
-        ).text.strip()
-
-        if not transcript:
-            continue
-
-        print(f"[Heard] {transcript}")
-
-        # Detect "what is a X" or "I don't know what X is"
-        match = re.search(r"what(?:'s| is) (?:a |an )?([\w\s]+?)(?:\?|$)", transcript, re.IGNORECASE)
-        if match:
-            show_help(match.group(1).strip())
+    return {
+        "step": step,
+        "image_url": image_url,
+    }
 
 
 if __name__ == "__main__":
-    listen_and_detect()
+    TEST_STEP = "Matcha powder is sifted into a mug"
+
+    print(f"Testing step: '{TEST_STEP}'\n")
+
+    print("--- get_step_details ---")
+    print(get_step_details(TEST_STEP))
+
+    print("\n--- get_step_image ---")
+    print(get_step_image(TEST_STEP))
