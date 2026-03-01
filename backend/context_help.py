@@ -1,6 +1,7 @@
-import tempfile
-from icrawler.builtin import BingImageCrawler
-from icrawler import ImageDownloader
+import re
+import html
+import urllib.parse
+import requests
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -8,29 +9,33 @@ load_dotenv()
 client = OpenAI()
 
 
-# --- Image URL capture (no download) ---
-
-class _URLOnlyDownloader(ImageDownloader):
-    """Hooks into icrawler to capture the first image URL without saving anything."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.captured_url = None
-
-    def download(self, task, default_ext, timeout=None, max_retry=3, overwrite=False, **kwargs):
-        if self.captured_url is None:
-            self.captured_url = task.get("file_url")
-
+# --- Image URL via direct Bing scrape ---
 
 def _get_image_url(query: str) -> str | None:
-    with tempfile.TemporaryDirectory() as tmp:
-        crawler = BingImageCrawler(
-            downloader_cls=_URLOnlyDownloader,
-            storage={"root_dir": tmp},
-            downloader_threads=1,
-        )
-        crawler.crawl(keyword=query, max_num=1)
-        return crawler.downloader.captured_url
+    """Scrape Bing Image Search for the first result URL."""
+    try:
+        url = "https://www.bing.com/images/search?" + urllib.parse.urlencode({"q": query, "first": 1})
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.get(url, headers=headers, timeout=8)
+        resp.raise_for_status()
+
+        # Bing HTML-encodes quotes as &quot; — decode first, then extract murl values
+        decoded = html.unescape(resp.text)
+        matches = re.findall(r'"murl"\s*:\s*"(https?://[^"]+)"', decoded)
+        if matches:
+            return matches[0]
+    except Exception as e:
+        print(f"[context_help] Bing image search failed: {e}")
+
+    return None
 
 
 # --- Step context ---
@@ -91,24 +96,38 @@ def get_step_image(step: str, recipe: str | None = None) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "Given a cooking recipe step, return a short image search query (6 words max) "
-                    "that finds a photo of this action IN A KITCHEN with FOOD.\n"
-                    "The query MUST include a food or kitchen term (e.g. 'kitchen', 'cooking', 'food', an ingredient name, or a utensil).\n"
-                    "NEVER return a generic query that could match non-food images.\n\n"
-                    "Example: Step: 'A bowl is placed on a flat surface' → 'mixing bowl on kitchen counter'\n"
-                    "Example: Step: 'Matcha powder is sifted into a mug' → 'sifting matcha powder into mug'\n"
-                    "Example: Step: 'Butter is melted in a pan' → 'butter melting in frying pan'\n"
-                    "Example: Step: 'Ingredients are combined in a bowl' → 'mixing ingredients in kitchen bowl'\n"
-                    "Return only the search query, nothing else."
+                    "Given a cooking recipe step, return ONLY the key subject (3-5 words max) that describes what the result looks like.\n"
+                    "Strip away all fluff — just the core object or food state.\n"
+                    "Think: what would you Google to find the simplest, most basic photo of this?\n\n"
+                    "Example: Step: 'A mug is placed on the counter' → 'empty white mug'\n"
+                    "Example: Step: 'A bowl is placed on a flat surface' → 'empty mixing bowl'\n"
+                    "Example: Step: 'Matcha powder is sifted into a mug' → 'matcha powder in mug'\n"
+                    "Example: Step: 'Butter is melted in a pan' → 'melted butter in pan'\n"
+                    "Example: Step: 'Eggs and sugar are whisked together' → 'whisked eggs and sugar'\n"
+                    "Example: Step: 'Dough is kneaded on a floured surface' → 'kneaded dough ball'\n"
+                    "Return only the search subject, nothing else."
                 ),
             },
             {"role": "user", "content": f"Step: {step}"},
         ],
         temperature=0.3,
     )
-    query = query_response.choices[0].message.content.strip()
-    # Always append "cooking food" so Bing biases toward kitchen/food results
-    image_url = _get_image_url(query + " cooking food")
+    query = query_response.choices[0].message.content.strip().strip('"\'')
+    print(f"[context_help] Image query: {query}")
+
+    # Search for the simplest, most basic photo
+    image_url = _get_image_url(query + " simple white background")
+
+    # Fallback: try without the background hint
+    if not image_url:
+        print(f"[context_help] No results, retrying without background hint")
+        image_url = _get_image_url(query)
+
+    # Last resort: search the raw step text
+    if not image_url:
+        short_step = " ".join(step.split()[:5])
+        print(f"[context_help] Still no results, trying raw step: {short_step}")
+        image_url = _get_image_url(short_step)
 
     return {
         "step": step,

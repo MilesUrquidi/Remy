@@ -44,13 +44,23 @@ _URL_RECIPE_EXAMPLES = [
     {
         "role": "assistant",
         "content": json.dumps([
-            "1½ cups of flour, 3½ tsp of baking powder, 1 tbsp of sugar, and ¼ tsp of salt are combined in a large bowl",
-            "1¼ cups of milk, 1 egg, and 3 tbsp of melted butter are whisked together in a separate bowl",
-            "Wet mixture is poured into the dry bowl and stirred until just combined",
+            "A large bowl is placed on the counter",
+            "1½ cups of flour is added to the bowl",
+            "3½ tsp of baking powder is added to the bowl",
+            "1 tbsp of sugar is added to the bowl",
+            "¼ tsp of salt is added to the bowl",
+            "Dry ingredients are mixed together in the bowl",
+            "A separate bowl is placed on the counter",
+            "1¼ cups of milk is poured into the second bowl",
+            "1 egg is cracked into the second bowl",
+            "3 tbsp of melted butter is added to the second bowl",
+            "Wet ingredients are whisked together",
+            "Wet mixture is poured into the dry bowl",
+            "Batter is stirred until just combined",
             "A skillet is placed on the stovetop over medium-high heat",
-            "¼ cup of batter is poured onto the heated skillet for each pancake",
-            "Pancakes are cooking with bubbles forming across the surface and edges looking set",
-            "Pancakes are flipped and the second side is golden brown",
+            "¼ cup of batter is poured onto the heated skillet",
+            "Bubbles are forming across the pancake surface",
+            "Pancake is flipped and the second side is golden brown",
         ]),
     },
     {
@@ -83,13 +93,24 @@ _URL_RECIPE_EXAMPLES = [
         "role": "assistant",
         "content": json.dumps([
             "Oven is set to 375°F",
-            "2¼ cups of flour, 1 tsp of baking soda, and 1 tsp of salt are combined in a bowl",
-            "1 cup of softened butter, ¾ cup of granulated sugar, and ¾ cup of brown sugar are beaten together in a large bowl until creamy",
-            "2 eggs and 2 tsp of vanilla extract are added to the butter mixture and beaten in",
+            "A bowl is placed on the counter",
+            "2¼ cups of flour is added to the bowl",
+            "1 tsp of baking soda is added to the bowl",
+            "1 tsp of salt is added to the bowl",
+            "Dry ingredients are mixed together",
+            "A large bowl is placed on the counter",
+            "1 cup of softened butter is added to the large bowl",
+            "¾ cup of granulated sugar is added to the large bowl",
+            "¾ cup of brown sugar is added to the large bowl",
+            "Butter and sugars are beaten until creamy",
+            "2 eggs are cracked into the butter mixture",
+            "2 tsp of vanilla extract is added to the butter mixture",
+            "Eggs and vanilla are beaten into the mixture",
             "Flour mixture is gradually blended into the butter bowl",
             "2 cups of chocolate chips are stirred into the dough",
-            "Rounded tablespoons of dough are placed on ungreased baking sheets",
-            "Baking sheets are in the oven and cookies are baked until golden brown",
+            "Rounded tablespoons of dough are placed on baking sheets",
+            "Baking sheets are placed in the oven",
+            "Cookies are golden brown and done baking",
         ]),
     },
 ]
@@ -160,7 +181,7 @@ def _fetch_html(url: str) -> str | None:
             "application/signed-exchange;v=b3;q=0.7"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Upgrade-Insecure-Requests": "1",
@@ -315,24 +336,6 @@ def steps_from_url(url: str, avoid: list[str] | None = None) -> list[str]:
     """
     print(f"[onlinerecipe] Fetching: {url}")
     recipe_text = fetch_recipe(url)
-
-    # Validate the page is actually a recipe
-    check = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "system",
-                "content": "You check if text contains a food or drink recipe. Reply with only 'yes' or 'no'.",
-            },
-            {"role": "user", "content": recipe_text[:2000]},
-        ],
-        temperature=0,
-    )
-    if check.choices[0].message.content.strip().lower() != "yes":
-        raise ValueError(
-            "That URL doesn't appear to contain a food or drink recipe. "
-            "Please provide a valid recipe link."
-        )
 
     # Build the user message — include allergen note if needed
     user_content = f"Here is a recipe. Break it into camera-verifiable steps:\n\n{recipe_text}"

@@ -6,7 +6,6 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 
 // Palette
@@ -184,11 +183,18 @@ export default function Home() {
       const res = await fetch(`${BACKEND_URL}/step/safety?step=${encodeURIComponent(step)}`);
       const data = await res.json();
       if (data.caution) {
-        toast.warning(data.caution, {
-          description: data.tip ? `💡 Tip: ${data.tip}` : undefined,
+        toast(data.caution, {
+          description: data.tip ? `Tip: ${data.tip}` : undefined,
           duration: 8000,
-          icon: "⚠️",
+          icon: "‼️",
+          style: { background: "#f0ede9", color: "#5a5a4a", border: "1px solid #e0dbd4" },
         });
+      }
+    } catch {
+      // optional — fine to fail silently
+    }
+  }
+
   async function loadStepImage(step: string, recipe?: string) {
     if (stepImages[step]) return; // already loaded
     try {
@@ -229,6 +235,40 @@ export default function Home() {
   function canStart() {
     if (inputMode === "describe") return prompt.trim().length > 0;
     return urlParsed;
+  }
+
+  // ── Start cooking — camera + SSE + coaching screen ──────────────
+
+  async function startCooking(stepsToUse: string[]) {
+    // 1. Start camera + AI pipeline
+    await fetch(`${BACKEND_URL}/camera/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    // 2. Set first step
+    await fetch(`${BACKEND_URL}/recipe/set-step`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step: stepsToUse[0] }),
+    });
+
+    // 3. Open SSE stream
+    connectSSE();
+
+    setCurrentStep(0);
+    setDisplayStep(0);
+    setStepCompleted(false);
+    setStepCheckData(null);
+    setRemySpeech("");
+    setCameraActive(true);
+    crossFadeTo("coaching");
+
+    // 4. Load first step details + image in background
+    loadStepDetails(stepsToUse[0]);
+    loadStepCaution(stepsToUse[0]);
+    loadStepImage(stepsToUse[0], recipeName);
   }
 
   // ── Start — calls backend, then connects SSE ───────────────────
@@ -395,8 +435,9 @@ export default function Home() {
 
           {/* Error banner */}
           {apiError && (
-            <div className="w-full max-w-lg rounded-xl px-4 py-3 text-sm" style={{ background: "#fee2e2", color: "#dc2626", border: "1px solid #fca5a5" }}>
-              ⚠️ {apiError}
+            <div className="w-full max-w-lg rounded-xl px-3 py-2.5 text-sm flex items-center gap-2" style={{ background: "#f0ede9", color: "#5a5a4a", border: "1px solid #e0dbd4" }}>
+              <span className="shrink-0">‼️</span>
+              <span className="truncate">{apiError}</span>
             </div>
           )}
 
@@ -476,7 +517,7 @@ export default function Home() {
           <button
             onClick={handleStart}
             disabled={!canStart()}
-            className="w-full max-w-lg rounded-2xl py-3 text-base font-semibold transition-all duration-200 ease-out disabled:opacity-30 disabled:cursor-not-allowed hover:brightness-110 hover:scale-[1.01] active:scale-[0.98]"
+            className="w-full max-w-lg rounded-2xl py-3 text-base font-semibold transition-all duration-200 ease-out disabled:opacity-30 disabled:cursor-not-allowed hover:brightness-105 hover:scale-[1.01] active:scale-[0.98]"
             style={{ background: "#D4A017", color: "#fff" }}
           >
             Let&apos;s Cook →
@@ -531,19 +572,11 @@ export default function Home() {
 
           {/* Brand */}
           <div className="w-full max-w-lg flex flex-col items-center gap-2 text-center">
-            <div className="flex items-center gap-3 mb-1">
-              <span className="text-4xl">🐀</span>
-              <span className="text-5xl font-bold tracking-tight" style={{ color: "#2C5F2E" }}>Remy</span>
-            </div>
-            <div className="w-12 h-0.5 rounded-full my-2" style={{ background: "#D4A017" }} />
-            <h1 className="text-2xl font-semibold" style={{ color: "#3a3a2a" }}>Any allergies?</h1>
-            <p className="text-sm" style={{ color: "#97BC62" }}>
-              We found these in your recipe. Check any you&apos;re allergic to — Remy will swap them out.
-            </p>
+            <h1 className="text-4xl font-semibold" style={{ color: "#3a3a2a" }}>Any allergies?</h1>
           </div>
 
           {/* Allergen toggle cards */}
-          <div className="w-full max-w-lg grid grid-cols-2 gap-3">
+          <div className="w-full max-w-lg grid grid-cols-2 gap-3 mt-4">
             {detectedAllergens.map(allergen => {
               const checked = selectedAllergens.includes(allergen);
               return (
@@ -584,28 +617,27 @@ export default function Home() {
           )}
 
           {/* CTA buttons */}
-          <div className="w-full max-w-lg flex flex-col gap-3">
+          <div className="w-full max-w-lg flex flex-col gap-3 mt-4">
             {selectedAllergens.length > 0 && (
-              <Button
+              <button
                 onClick={handleAllergenContinue}
-                className="w-full rounded-2xl h-12 text-base font-semibold hover:opacity-90"
-                style={{ background: "#2C5F2E", color: "#fff" }}
+                className="w-full rounded-2xl h-12 text-base font-semibold transition-all duration-200 ease-out hover:brightness-105 hover:scale-[1.01] active:scale-[0.98]"
+                style={{ background: "#D4A017", color: "#fff" }}
               >
                 Adapt recipe &amp; Continue →
-              </Button>
+              </button>
             )}
-            <Button
-              variant="outline"
+            <button
               onClick={handleAllergenContinue}
-              className="w-full rounded-2xl h-12 text-base font-semibold"
+              className="w-full rounded-2xl h-12 text-base font-semibold transition-all duration-200 ease-out hover:brightness-105 hover:scale-[1.01] active:scale-[0.98]"
               style={
                 selectedAllergens.length > 0
-                  ? { color: "#97BC62", borderColor: "#e8e0d8" }
+                  ? { background: "#D4A01715", color: "#D4A017", border: "1.5px solid #D4A01750" }
                   : { background: "#D4A017", color: "#fff", border: "none" }
               }
             >
-              {selectedAllergens.length > 0 ? "No thanks — Let\u2019s Cook!" : "No changes — Let\u2019s Cook! \u2192"}
-            </Button>
+              {selectedAllergens.length > 0 ? "No thanks \u2014 Let\u2019s Cook!" : "No changes \u2014 Let\u2019s Cook! \u2192"}
+            </button>
           </div>
 
         </div>
@@ -640,7 +672,8 @@ export default function Home() {
               setCameraActive(false);
               crossFadeTo("prompt");
             }}
-            className="mt-4 rounded-2xl px-8 py-3 text-sm font-medium transition-all duration-200 ease-out hover:brightness-110 hover:scale-[1.02] active:scale-[0.98] text-neutral-50 bg-neutral-800"
+            className="mt-4 rounded-2xl px-8 py-3 text-sm font-semibold transition-all duration-200 ease-out hover:brightness-105 hover:scale-[1.01] active:scale-[0.98]"
+            style={{ background: "#D4A017", color: "#fff" }}
           >
             Cook something else
           </button>
@@ -860,11 +893,10 @@ export default function Home() {
             <button
               onClick={handleNext}
               disabled={animating}
-              className="w-full rounded-2xl py-4 text-lg font-semibold transition-all duration-200 ease-out hover:brightness-110 hover:scale-[1.01] active:scale-[0.98] disabled:opacity-50"
+              className="w-full rounded-2xl py-4 text-lg font-semibold transition-all duration-200 ease-out hover:brightness-105 hover:scale-[1.01] active:scale-[0.98] disabled:opacity-50"
               style={{
-                background: stepCompleted ? "#2C5F2E" : "#D4A017",
+                background: "#D4A017",
                 color: "#fff",
-                transition: "background 0.4s ease",
               }}
             >
               {currentStep < steps.length - 1

@@ -148,6 +148,7 @@ _TASK_DECOMP_SYSTEM = """You are a recipe decomposition engine for a real-time A
 Given a food or drink to make, break it into ordered preparation steps that a camera can verify one frame at a time.
 
 Rules for every step:
+- ONE INGREDIENT OR ONE ACTION PER STEP. Never combine multiple ingredients into a single step. "Add flour and sugar" must be two separate steps.
 - Describes a single visible state of ingredients or tools (not an action in motion)
 - Can be confirmed TRUE or FALSE from one video frame (e.g. "bread is on the plate", "ice is in the glass")
 - Written as one short imperative sentence (max 10 words)
@@ -155,6 +156,7 @@ Rules for every step:
 - Cover the full recipe from start to finish
 - If a step requires a specific kitchen tool (knife, peeler, grater, pan, etc.), name it explicitly in the step (e.g. "cut apple into slices using a knife")
 - Include an approximate single-serving measurement for every ingredient the first time it appears in a step (e.g. "2 tbsp of peanut butter", "1 cup of milk", "3g of matcha powder"). Assume the recipe makes exactly one portion.
+- Err on the side of MORE steps. It is much better to have too many small steps than too few big ones.
 
 Return ONLY a raw JSON array of strings. No markdown, no explanation, no extra keys."""
 
@@ -165,7 +167,7 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["Two slices of bread are laid flat on a surface", "2 tbsp of peanut butter is spread across one slice using a butter knife", "1½ tbsp of jelly is spread across the other slice using a butter knife", "Both slices are pressed together face-down"]'
+        "content": '["Two slices of bread are laid flat on a surface", "A butter knife is placed next to the bread", "2 tbsp of peanut butter is scooped with the knife", "Peanut butter is spread across one slice", "1½ tbsp of jelly is scooped with the knife", "Jelly is spread across the other slice", "Both slices are pressed together face-down"]'
     },
     {
         "role": "user",
@@ -189,7 +191,7 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "½ an avocado is halved using a knife", "Avocado flesh is scooped and spread across the toast using a butter knife", "A pinch of salt and pepper are sprinkled on top"]'
+        "content": '["A slice of bread is placed on a flat surface", "Bread is placed in the toaster", "Toasted bread is placed back on the surface", "½ an avocado is halved using a knife", "Avocado pit is removed", "Avocado flesh is scooped onto the toast", "Avocado is spread across the toast using a butter knife", "A pinch of salt is sprinkled on top", "A pinch of pepper is sprinkled on top"]'
     },
 ]
 
