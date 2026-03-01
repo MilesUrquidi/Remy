@@ -313,7 +313,7 @@ def transcribe_worker():
                 print(f"[Transcript] {text}")
                 with latest_frame_lock:
                     frame_copy = latest_frame.copy() if latest_frame is not None else None
-                speech_queue.put((text, frame_copy, True))  # remember=True
+                speech_queue.put((text, frame_copy, True, CURRENT_STEP_LABEL))
         except Exception as e:
             print(f"[Transcript] Whisper error: {e}")
 
@@ -334,7 +334,7 @@ def video_worker():
             except queue.Empty:
                 pass
             try:
-                video_check_queue.put_nowait((VIDEO_PROMPT, frame_copy, False))
+                video_check_queue.put_nowait((VIDEO_PROMPT, frame_copy, False, CURRENT_STEP_LABEL))
             except queue.Full:
                 pass  # shouldn't happen after the drain above
 
@@ -357,12 +357,11 @@ def gpt_worker(system_prompt=None):
             except queue.Empty:
                 continue
 
-        text, frame, remember = item
+        text, frame, remember, step_label = item
 
         # Print a clean label so it's easy to read during testing
         if not remember:
-            label = CURRENT_STEP_LABEL or "general observation"
-            print(f"\n[Step Check] '{label}'")
+            print(f"\n[Step Check] '{step_label or 'general observation'}'")
             print(f"[AI] ", end="", flush=True)
         else:
             print(f"\n[You said] '{text}'")
@@ -399,14 +398,14 @@ def gpt_worker(system_prompt=None):
                     data = full
                 results_queue.put({
                     "type": "step_check",
-                    "step": CURRENT_STEP_LABEL,
+                    "step": step_label,
                     "data": data,
                 })
             else:
                 # Speech response
                 results_queue.put({
                     "type": "speech",
-                    "step": CURRENT_STEP_LABEL,
+                    "step": step_label,
                     "data": full,
                 })
 

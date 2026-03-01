@@ -71,6 +71,7 @@ export default function Home() {
   const eventSourceRef = useRef<EventSource | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleNextRef = useRef<() => Promise<void>>(async () => {});
+  const currentStepLabelRef = useRef<string>("");
 
   // Cleanup SSE on unmount
   useEffect(() => {
@@ -81,6 +82,11 @@ export default function Home() {
   useEffect(() => {
     handleNextRef.current = handleNext;
   });
+
+  // Keep current step label ref in sync so the SSE handler can filter stale results
+  useEffect(() => {
+    currentStepLabelRef.current = steps[currentStep] ?? "";
+  }, [steps, currentStep]);
 
   // Auto-advance when the AI confirms the step is complete
   useEffect(() => {
@@ -105,6 +111,9 @@ export default function Home() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === "step_check") {
+          // Ignore stale results from a previous step
+          if (msg.step && msg.step !== currentStepLabelRef.current) return;
+
           // Backend strips markdown fences before sending, but handle
           // string fallback here too in case GPT slips through anyway.
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -120,7 +129,11 @@ export default function Home() {
             if (data.completed) setStepCompleted(true);
           }
         } else if (msg.type === "speech") {
-          setRemySpeech(msg.data as string);
+          const text = (msg.data as string).trim();
+          // Ignore JSON responses — these are step-check bleed from false VAD triggers
+          if (!text.startsWith("{") && !text.startsWith("```")) {
+            setRemySpeech(text);
+          }
         }
       } catch {
         // ignore malformed frames
