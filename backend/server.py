@@ -259,20 +259,30 @@ async def tts(req: TTSRequest):
     Returns MP3 audio as a streaming response.
     Frontend should stop any playing audio and replace it when a new response arrives.
     """
-    def _generate_audio():
-        with _openai_client.audio.speech.with_streaming_response.create(
-            model="tts-1",
-            voice=req.voice,
-            input=req.text,
-            response_format="mp3",
-        ) as response:
-            yield from response.iter_bytes(chunk_size=4096)
+    import queue as _queue
+    chunk_queue: _queue.Queue = _queue.Queue()
 
-    loop = asyncio.get_event_loop()
-    audio_iter = await loop.run_in_executor(None, lambda: list(_generate_audio()))
+    def _generate_audio():
+        try:
+            with _openai_client.audio.speech.with_streaming_response.create(
+                model="tts-1",
+                voice=req.voice,
+                input=req.text,
+                response_format="mp3",
+            ) as response:
+                for chunk in response.iter_bytes(chunk_size=4096):
+                    chunk_queue.put(chunk)
+        finally:
+            chunk_queue.put(None)  # sentinel
+
+    threading.Thread(target=_generate_audio, daemon=True).start()
 
     async def _stream():
-        for chunk in audio_iter:
+        loop = asyncio.get_event_loop()
+        while True:
+            chunk = await loop.run_in_executor(None, chunk_queue.get)
+            if chunk is None:
+                break
             yield chunk
 
     return StreamingResponse(

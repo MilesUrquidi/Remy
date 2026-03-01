@@ -148,14 +148,16 @@ export default function Home() {
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audioRef.current = audio;
-      audio.play();
-      audio.onended = () => {
+      const cleanup = () => {
         URL.revokeObjectURL(url);
-        if (isStepAnnouncement) stepSpeakingRef.current = false;
+        stepSpeakingRef.current = false;
       };
+      audio.onended = cleanup;
+      audio.onerror = cleanup;
+      audio.play().catch(cleanup);
     } catch {
       // TTS failure is non-fatal — text is still displayed
-      if (isStepAnnouncement) stepSpeakingRef.current = false;
+      stepSpeakingRef.current = false;
     }
   }
 
@@ -303,7 +305,7 @@ export default function Home() {
     await fetch(`${BACKEND_URL}/camera/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
+      body: JSON.stringify({ recipe: recipeName, steps: stepsToUse }),
     });
 
     // 2. Set first step
