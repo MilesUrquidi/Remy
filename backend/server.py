@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from chatgpt import generate_task_steps
 from camera import get_camo_feed, set_current_step, results_queue, audio_running, get_latest_frame_jpeg, stop_pipeline
 from context_help import get_step_details, get_step_image
+from caution import get_safety_caution
 
 app = FastAPI()
 
@@ -141,6 +142,15 @@ def step_details(step: str):
 def step_image(step: str):
     """Return an image URL showing the completed state of a recipe step."""
     return get_step_image(step)
+
+
+@app.get("/step/safety")
+def step_safety(step: str):
+    """Return a safety caution + tip for a recipe step, or null values if none."""
+    data = get_safety_caution(step)
+    if data is None:
+        return {"caution": None, "tip": None}
+    return {"caution": data.get("caution"), "tip": data.get("tip")}
 
 # ---------------------------------------------------------------------------
 # SSE stream  —  frontend subscribes here to get live AI results

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { toast } from "sonner";
 
 // Palette
 // #2C5F2E — deep forest green (primary)
@@ -161,6 +162,22 @@ export default function Home() {
     }
   }
 
+  async function loadStepCaution(step: string) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/step/safety?step=${encodeURIComponent(step)}`);
+      const data = await res.json();
+      if (data.caution) {
+        toast.warning(data.caution, {
+          description: data.tip ? `💡 Tip: ${data.tip}` : undefined,
+          duration: 8000,
+          icon: "⚠️",
+        });
+      }
+    } catch {
+      // optional — fine to fail silently
+    }
+  }
+
   // ── Navigation helpers ─────────────────────────────────────────
 
   function crossFadeTo(nextPhase: "prompt" | "loading" | "coaching") {
@@ -241,8 +258,9 @@ export default function Home() {
       setCameraActive(true);
       crossFadeTo("coaching");
 
-      // 5. Load first step details in background
+      // 5. Load first step details + caution in background
       loadStepDetails(newSteps[0]);
+      loadStepCaution(newSteps[0]);
 
     } catch (err) {
       clearInterval(interval);
@@ -298,6 +316,7 @@ export default function Home() {
       setDisplayStep(nextIdx);
       setAnimating(false);
       loadStepDetails(steps[nextIdx]);
+      loadStepCaution(steps[nextIdx]);
     }, 400);
   }
 

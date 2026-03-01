@@ -153,6 +153,7 @@ Rules for every step:
 - Written as one short imperative sentence (max 10 words)
 - No time-based instructions ("wait 2 minutes") — visible state only
 - Cover the full recipe from start to finish
+- If a step requires a specific kitchen tool (knife, peeler, grater, pan, etc.), name it explicitly in the step (e.g. "cut apple into slices using a knife")
 
 Return ONLY a raw JSON array of strings. No markdown, no explanation, no extra keys."""
 
@@ -163,7 +164,7 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["Two slices of bread are laid flat on a surface", "Peanut butter is spread across one slice", "Jelly is spread across the other slice", "Both slices are pressed together face-down"]'
+        "content": '["Two slices of bread are laid flat on a surface", "Peanut butter is spread across one slice using a butter knife", "Jelly is spread across the other slice using a butter knife", "Both slices are pressed together face-down"]'
     },
     {
         "role": "user",
@@ -187,7 +188,7 @@ _TASK_DECOMP_EXAMPLES = [
     },
     {
         "role": "assistant",
-        "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "Avocado is scooped and spread across the toast", "Salt and pepper are sprinkled on top"]'
+        "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "Avocado is halved using a knife", "Avocado is scooped and spread across the toast using a butter knife", "Salt and pepper are sprinkled on top"]'
     },
 ]
 
