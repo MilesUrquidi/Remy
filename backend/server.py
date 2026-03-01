@@ -8,10 +8,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from chatgpt import generate_task_steps
-from camera import get_camo_feed, set_current_step, results_queue, audio_running, get_latest_frame_jpeg, stop_pipeline
+from camera import get_camo_feed, set_current_step, set_current_recipe, results_queue, audio_running, get_latest_frame_jpeg, stop_pipeline
 from context_help import get_step_details, get_step_image
 from caution import get_safety_caution, get_allergens, get_recipe_allergens
 from onlinerecipe import steps_from_url, fetch_recipe
+from openai import OpenAI as _OpenAI
+from dotenv import load_dotenv as _load_dotenv
+
+_load_dotenv()
+_openai_client = _OpenAI()
 
 app = FastAPI()
 
@@ -40,8 +45,13 @@ class StepRequest(BaseModel):
     step: str
 
 class StartRequest(BaseModel):
-    system_prompt: str | None = None
     camera_index: int | None = None
+    recipe: str | None = None       # e.g. "spaghetti carbonara"
+    steps: list[str] = []           # full ordered step list for context
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "alloy"  # alloy | echo | fable | onyx | nova | shimmer
 
 class SafeRecipeRequest(BaseModel):
     food: str
@@ -52,14 +62,6 @@ class SafeRecipeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 _camera_thread: threading.Thread | None = None
-
-SYSTEM_PROMPT_DEFAULT = (
-    "You are a precise real-time recipe vision assistant. "
-    "When checking recipe steps, you analyze a previous frame and a current frame from a live camera feed. "
-    "Always return structured JSON with completed, state, and action fields as instructed. "
-    "When the user speaks, respond briefly and helpfully. "
-    "Be consistent and strict — only mark a step complete when it is clearly visible."
-)
 
 # ---------------------------------------------------------------------------
 # Recipe
@@ -119,14 +121,17 @@ def start_camera(req: StartRequest):
         if _camera_thread.is_alive():
             return {"ok": False, "message": "Camera still shutting down — try again in a moment"}
 
+    # Store recipe context so Remy knows what's being cooked
+    if req.recipe:
+        set_current_recipe(req.recipe, req.steps)
+
     # Set audio_running BEFORE returning so the /camera/feed generator
     # is already live when the frontend renders the <img> tag.
     audio_running.set()
 
-    prompt = req.system_prompt or SYSTEM_PROMPT_DEFAULT
     _camera_thread = threading.Thread(
         target=get_camo_feed,
-        kwargs={"system_prompt": prompt, "camera_index": req.camera_index},
+        kwargs={"camera_index": req.camera_index},
         daemon=True,
     )
     _camera_thread.start()
@@ -240,6 +245,40 @@ async def stream():
             "Connection":        "keep-alive",
             "X-Accel-Buffering": "no",   # disable nginx buffering if behind a proxy
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# TTS  —  async so it never blocks the server
+# ---------------------------------------------------------------------------
+
+@app.post("/tts")
+async def tts(req: TTSRequest):
+    """
+    Generate speech audio from text using OpenAI TTS.
+    Returns MP3 audio as a streaming response.
+    Frontend should stop any playing audio and replace it when a new response arrives.
+    """
+    def _generate_audio():
+        with _openai_client.audio.speech.with_streaming_response.create(
+            model="tts-1",
+            voice=req.voice,
+            input=req.text,
+            response_format="mp3",
+        ) as response:
+            yield from response.iter_bytes(chunk_size=4096)
+
+    loop = asyncio.get_event_loop()
+    audio_iter = await loop.run_in_executor(None, lambda: list(_generate_audio()))
+
+    async def _stream():
+        for chunk in audio_iter:
+            yield chunk
+
+    return StreamingResponse(
+        _stream(),
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-cache"},
     )
 
 

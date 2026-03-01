@@ -84,10 +84,19 @@ export default function Home() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleNextRef = useRef<() => Promise<void>>(async () => { });
   const currentStepLabelRef = useRef<string>("");
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // True while Remy is reading a step aloud — suppresses overlapping speech events
+  const stepSpeakingRef = useRef<boolean>(false);
 
-  // Cleanup SSE on unmount
+  // Cleanup SSE and audio on unmount
   useEffect(() => {
-    return () => { eventSourceRef.current?.close(); };
+    return () => {
+      eventSourceRef.current?.close();
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
   }, []);
 
   // Keep handleNextRef pointing at the latest handleNext closure
@@ -111,6 +120,44 @@ export default function Home() {
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stepCompleted]);
+
+  // ── TTS playback — stop-and-replace on new speech ──────────────
+
+  async function speak(text: string, isStepAnnouncement = false) {
+    // Stop whatever is currently playing immediately
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
+      audioRef.current = null;
+    }
+
+    if (isStepAnnouncement) stepSpeakingRef.current = true;
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice: "fable" }),
+      });
+      if (!res.ok) {
+        if (isStepAnnouncement) stepSpeakingRef.current = false;
+        return;
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.play();
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        if (isStepAnnouncement) stepSpeakingRef.current = false;
+      };
+    } catch {
+      // TTS failure is non-fatal — text is still displayed
+      if (isStepAnnouncement) stepSpeakingRef.current = false;
+    }
+  }
 
   // ── SSE connection ─────────────────────────────────────────────
 
@@ -151,6 +198,8 @@ export default function Home() {
             if (parsed && typeof parsed === "object" && ("completed" in parsed || "state" in parsed || "action" in parsed)) return;
           } catch { /* not JSON — good, it's real speech */ }
           setRemySpeech(text);
+          // Don't interrupt Remy reading the step aloud
+          if (!stepSpeakingRef.current) speak(text);
         }
       } catch {
         // ignore malformed frames
@@ -166,16 +215,26 @@ export default function Home() {
 
   // ── Step details (optional, background fetch) ──────────────────
 
-  async function loadStepDetails(step: string) {
+  async function loadStepDetails(step: string): Promise<string | null> {
     try {
       const res = await fetch(`${BACKEND_URL}/step/details?step=${encodeURIComponent(step)}`);
       const data = await res.json();
       if (data.details) {
         setStepDetails(prev => ({ ...prev, [step]: data.details }));
+        return data.details as string;
       }
     } catch {
       // optional — fine to fail silently
     }
+    return null;
+  }
+
+  // ── Announce a step — reads title + detail aloud together ──────
+
+  async function announceStep(step: string) {
+    const detail = await loadStepDetails(step);
+    const text = detail ? `${step}. ${detail}` : step;
+    speak(text, true);
   }
 
   async function loadStepCaution(step: string) {
@@ -319,8 +378,8 @@ export default function Home() {
 
       // 3. No allergens — go straight to cooking
       await startCooking(newSteps);
-      // 5. Load first step details + image in background
-      loadStepDetails(newSteps[0]);
+      // 4. Load first step details + image in background, then read aloud
+      announceStep(newSteps[0]);
       loadStepImage(newSteps[0], food);
 
     } catch (err) {
@@ -363,6 +422,7 @@ export default function Home() {
 
   async function handleEndRecipe() {
     eventSourceRef.current?.close();
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
     setCameraActive(false);
     setShowCompletionOverlay(false);
     try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch { }
@@ -405,7 +465,7 @@ export default function Home() {
     setTimeout(() => {
       setDisplayStep(nextIdx);
       setAnimating(false);
-      loadStepDetails(steps[nextIdx]);
+      announceStep(steps[nextIdx]);
       loadStepCaution(steps[nextIdx]);
       loadStepImage(steps[nextIdx], recipeName);
     }, 400);
@@ -572,7 +632,7 @@ export default function Home() {
 
           {/* Brand */}
           <div className="w-full max-w-lg flex flex-col items-center gap-2 text-center">
-            <h1 className="text-4xl font-semibold" style={{ color: "#3a3a2a" }}>Any allergies?</h1>
+            <h1 className="text-4xl font-semibold" style={{ color: "#3a3a2a" }}>Are you allergic to...</h1>
           </div>
 
           {/* Allergen toggle cards */}
