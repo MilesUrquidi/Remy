@@ -233,6 +233,9 @@ def set_current_recipe(recipe: str, steps: list[str] = []):
     global CURRENT_RECIPE, ALL_STEPS
     CURRENT_RECIPE = recipe
     ALL_STEPS = steps
+    # Clear conversation history so each new recipe starts a fresh chat
+    import chatgpt
+    chatgpt.conversation_history.clear()
 
 # Queues
 audio_queue         = queue.Queue()
