@@ -138,9 +138,9 @@ def step_details(step: str):
 
 
 @app.get("/step/image")
-def step_image(step: str):
+def step_image(step: str, recipe: str | None = None):
     """Return an image URL showing the completed state of a recipe step."""
-    return get_step_image(step)
+    return get_step_image(step, recipe=recipe)
 
 # ---------------------------------------------------------------------------
 # SSE stream  —  frontend subscribes here to get live AI results

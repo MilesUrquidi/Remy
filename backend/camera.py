@@ -184,25 +184,67 @@ VIDEO_INTERVAL = 1  # seconds between video-only GPT snapshots
 # Updated by set_current_step() as the user progresses through a recipe
 VIDEO_PROMPT       = "You are seeing a previous frame and a current frame. In one sentence, describe what changed between the two frames in terms of food preparation."
 CURRENT_STEP_LABEL = None  # human-readable label printed in terminal during testing
+LAST_STEP_MESSAGE  = ""    # dedup: reset when step changes
+
+def _word_set(text: str) -> set:
+    """Normalise a string and return its word set for similarity comparison."""
+    import re as _re
+    return set(_re.sub(r"[^a-z0-9 ]", "", text.lower()).split())
+
+
+def _states_similar(a: str, b: str, threshold: float = 0.4) -> bool:
+    """Return True if two state explanations are semantically similar enough to skip."""
+    if not a or not b:
+        return False
+    wa, wb = _word_set(a), _word_set(b)
+    if not wa or not wb:
+        return False
+    intersection = wa & wb
+    union = wa | wb
+    return len(intersection) / len(union) >= threshold
+
 
 def set_current_step(step: str):
     """Update the VIDEO_PROMPT to check for the current recipe step using two-frame comparison."""
-    global VIDEO_PROMPT, CURRENT_STEP_LABEL
+    global VIDEO_PROMPT, CURRENT_STEP_LABEL, LAST_STEP_MESSAGE
     CURRENT_STEP_LABEL = step
+    LAST_STEP_MESSAGE = ""  # reset dedup on step change
     VIDEO_PROMPT = (
-        f'You are a precise recipe vision assistant analyzing two frames from a live camera feed.\n'
+        f'You are a precise recipe vision assistant analyzing two consecutive frames from a live camera feed.\n'
         f'The current recipe step to verify is: "{step}"\n\n'
-        f'Examine both the previous frame and the current frame carefully, then return ONLY a raw JSON object '
+        f'Compare the previous frame and the current frame, then return ONLY a raw JSON object '
         f'with exactly this structure (no markdown, no explanation outside the JSON):\n'
         f'{{\n'
-        f'  "completed": <true if state.completed OR action.completed is true, otherwise false>,\n'
-        f'  "state": {{"completed": <true if the result of the step is clearly visible in the current frame>, "explanation": "<one sentence describing what you see in the current frame>"}},\n'
-        f'  "action": {{"completed": <true if a visible change occurred between the two frames that completes this step>, "explanation": "<one sentence describing what changed between the frames>"}}\n'
+        f'  "completed": <true if the step is clearly done, false otherwise>,\n'
+        f'  "state": {{\n'
+        f'    "completed": <true/false>,\n'
+        f'    "explanation": "<brief description of the current scene>"\n'
+        f'  }},\n'
+        f'  "action": {{\n'
+        f'    "completed": <true/false>,\n'
+        f'    "explanation": "<subtle description of what is happening right now>"\n'
+        f'  }},\n'
+        f'  "hint": "<a tiny, unique nudge to help the user — 6 words max>"\n'
         f'}}\n\n'
-        f'Rules:\n'
-        f'- completed is true if state.completed OR action.completed is true\n'
-        f'- Be strict: only mark completed true if you are clearly sure\n'
-        f'- Keep explanations to one short sentence each\n'
+        f'Rules for state.explanation:\n'
+        f'- Describe what you SEE on the surface right now in one calm sentence\n'
+        f'- e.g. "A bowl is sitting on the counter" or "Matcha powder is in the bowl"\n\n'
+        f'Rules for action.explanation:\n'
+        f'- ALWAYS describe a concrete physical thing you see — NEVER talk about "frames", "changes", or "visibility"\n'
+        f'- If nothing moved: describe the still scene, e.g. "The bowl is still on the table" or "The counter sits empty"\n'
+        f'- If something moved: describe the motion, e.g. "A hand is reaching for the whisk"\n'
+        f'- Keep it to ONE short sentence (under 12 words)\n'
+        f'- Be natural and observational, like a quiet narrator\n'
+        f'- FORBIDDEN phrases: "no change", "no visible change", "between frames", "has occurred", "nothing detected"\n'
+        f'- You MUST name a real object in the scene every time\n\n'
+        f'Rules for hint:\n'
+        f'- A tiny, friendly nudge to guide the user toward completing the step\n'
+        f'- e.g. "try placing the bowl closer", "grab a whisk from the drawer", "a little more powder"\n'
+        f'- Make each hint feel unique and specific to what you see — never repeat the same hint\n'
+        f'- If the step is completed, the hint should be a small encouragement like "looking great" or "nicely done"\n'
+        f'- Keep it casual, lowercase, 6 words max\n\n'
+        f'General rules:\n'
+        f'- Be strict: only mark completed true if the step is clearly and fully done\n'
         f'- Return raw JSON only, no markdown code blocks'
     )
 
@@ -344,6 +386,7 @@ def video_worker():
 def gpt_worker(system_prompt=None):
     """Pull items from speech_queue (priority) or video_check_queue and send to GPT-4o."""
     import json
+    global LAST_STEP_MESSAGE
 
     while audio_running.is_set() or not speech_queue.empty():
         # Speech has priority — process immediately if anything is waiting
@@ -396,6 +439,19 @@ def gpt_worker(system_prompt=None):
                     data = json.loads(clean)
                 except json.JSONDecodeError:
                     data = full
+
+                # Dedup: only push to frontend if action meaningfully changed
+                if isinstance(data, dict):
+                    action = data.get("action", {})
+                    new_action_msg = action.get("explanation", "") if isinstance(action, dict) else ""
+                    is_completed = data.get("completed") is True
+
+                    if not is_completed and _states_similar(new_action_msg, LAST_STEP_MESSAGE):
+                        print("[GPT] Skipping — action hasn't meaningfully changed.")
+                        continue
+
+                    LAST_STEP_MESSAGE = new_action_msg
+
                 results_queue.put({
                     "type": "step_check",
                     "step": step_label,

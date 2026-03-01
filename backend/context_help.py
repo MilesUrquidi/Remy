@@ -73,25 +73,32 @@ def get_step_details(step: str) -> dict:
     }
 
 
-def get_step_image(step: str) -> dict:
+def get_step_image(step: str, recipe: str | None = None) -> dict:
     """
     Returns an image URL showing what the completed state of the step looks like.
 
     Args:
         step: A single recipe step string.
+        recipe: The recipe name for context (e.g. "matcha latte").
 
     Returns:
         {"step": str, "image_url": str | None}
     """
-    # Ask GPT for a precise search query describing the completed state
+    # Ask GPT for a kitchen/food-specific search query for this step
     query_response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Given a recipe step, return a short image search query (5 words max) "
-                    "that finds a photo of what the result looks like after the step is complete. "
+                    "Given a cooking recipe step, return a short image search query (6 words max) "
+                    "that finds a photo of this action IN A KITCHEN with FOOD.\n"
+                    "The query MUST include a food or kitchen term (e.g. 'kitchen', 'cooking', 'food', an ingredient name, or a utensil).\n"
+                    "NEVER return a generic query that could match non-food images.\n\n"
+                    "Example: Step: 'A bowl is placed on a flat surface' → 'mixing bowl on kitchen counter'\n"
+                    "Example: Step: 'Matcha powder is sifted into a mug' → 'sifting matcha powder into mug'\n"
+                    "Example: Step: 'Butter is melted in a pan' → 'butter melting in frying pan'\n"
+                    "Example: Step: 'Ingredients are combined in a bowl' → 'mixing ingredients in kitchen bowl'\n"
                     "Return only the search query, nothing else."
                 ),
             },
@@ -100,7 +107,8 @@ def get_step_image(step: str) -> dict:
         temperature=0.3,
     )
     query = query_response.choices[0].message.content.strip()
-    image_url = _get_image_url(query)
+    # Always append "cooking food" so Bing biases toward kitchen/food results
+    image_url = _get_image_url(query + " cooking food")
 
     return {
         "step": step,
