@@ -414,13 +414,12 @@ def video_worker():
 def gpt_worker():
     """
     Process speech (priority) and video check items through GPT.
+
+    Speech items  -> speech_response()   -> conversational reply -> SSE "speech" event
+    Video items   -> vision_step_check() -> JSON step check      -> SSE "step_check" event
     """
     import json
     global LAST_STEP_MESSAGE
-
-    Speech items  → speech_response()   → conversational reply → SSE "speech" event
-    Video items   → vision_step_check() → JSON step check      → SSE "step_check" event
-    """
     while audio_running.is_set() or not speech_queue.empty():
         # Speech has priority
         item = None
