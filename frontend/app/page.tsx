@@ -122,7 +122,7 @@ export default function Home() {
       const res = await fetch(`${BACKEND_URL}/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, voice: "onyx" }),
+        body: JSON.stringify({ text, voice: "fable" }),
       });
       if (!res.ok) return;
 
@@ -254,11 +254,14 @@ export default function Home() {
       const newSteps: string[] = genData.steps;
       setSteps(newSteps);
 
-      // 2. Start camera + AI pipeline
+      // 2. Start camera + AI pipeline (pass recipe context so Remy knows what's being cooked)
       await fetch(`${BACKEND_URL}/camera/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          recipe: food,
+          steps: newSteps,
+        }),
       });
 
       // 3. Set first step

@@ -143,19 +143,38 @@ def vision_step_check(step: str, frame, previous_frame=None) -> str:
 # Speech response  —  conversational, updates history, streams
 # ---------------------------------------------------------------------------
 
-def speech_response(user_text: str, frame=None):
+def speech_response(user_text: str, frame=None, recipe: str = None, current_step: str = None, all_steps: list = None):
     """
     Respond to what the user said. Streams response chunks.
     Adds the exchange to conversation history.
 
     Args:
-        user_text: Transcribed speech from the user.
-        frame:     Optional current cv2 BGR frame for visual context.
+        user_text:    Transcribed speech from the user.
+        frame:        Optional current cv2 BGR frame for visual context.
+        recipe:       The recipe being made (e.g. "spaghetti carbonara").
+        current_step: The step the user is currently on.
+        all_steps:    Full ordered list of all recipe steps.
 
     Yields:
         str chunks of the assistant response.
     """
-    messages = [{"role": "system", "content": _SPEECH_SYSTEM}]
+    # Build a context-aware system prompt
+    system = _SPEECH_SYSTEM
+    if recipe or current_step:
+        context_lines = []
+        if recipe:
+            context_lines.append(f"The user is making: {recipe}")
+        if all_steps and current_step:
+            try:
+                step_num = all_steps.index(current_step) + 1
+                context_lines.append(f"They are on step {step_num} of {len(all_steps)}: \"{current_step}\"")
+            except ValueError:
+                context_lines.append(f"Current step: \"{current_step}\"")
+        elif current_step:
+            context_lines.append(f"Current step: \"{current_step}\"")
+        system = _SPEECH_SYSTEM + "\n\nCurrent context:\n" + "\n".join(context_lines)
+
+    messages = [{"role": "system", "content": system}]
     messages.extend(conversation_history)
 
     if frame is not None:

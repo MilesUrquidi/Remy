@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from chatgpt import generate_task_steps
-from camera import get_camo_feed, set_current_step, results_queue, audio_running, get_latest_frame_jpeg, stop_pipeline
+from camera import get_camo_feed, set_current_step, set_current_recipe, results_queue, audio_running, get_latest_frame_jpeg, stop_pipeline
 from context_help import get_step_details, get_step_image
 from openai import OpenAI as _OpenAI
 from dotenv import load_dotenv as _load_dotenv
@@ -37,6 +37,8 @@ class StepRequest(BaseModel):
 
 class StartRequest(BaseModel):
     camera_index: int | None = None
+    recipe: str | None = None       # e.g. "spaghetti carbonara"
+    steps: list[str] = []           # full ordered step list for context
 
 class TTSRequest(BaseModel):
     text: str
@@ -80,6 +82,10 @@ def start_camera(req: StartRequest):
         _camera_thread.join(timeout=3.0)
         if _camera_thread.is_alive():
             return {"ok": False, "message": "Camera still shutting down — try again in a moment"}
+
+    # Store recipe context so Remy knows what's being cooked
+    if req.recipe:
+        set_current_recipe(req.recipe, req.steps)
 
     # Set audio_running BEFORE returning so the /camera/feed generator
     # is already live when the frontend renders the <img> tag.

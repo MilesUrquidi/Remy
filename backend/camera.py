@@ -218,14 +218,21 @@ VIDEO_INTERVAL = 1  # seconds between passive step checks
 # Pipeline state
 # ---------------------------------------------------------------------------
 
-# Set by set_current_step() as the user progresses
+# Set by set_current_step() / set_current_recipe() as the session progresses
 CURRENT_STEP       = None   # step text passed to vision_step_check
 CURRENT_STEP_LABEL = None   # same value, kept as alias for clarity
+CURRENT_RECIPE     = None   # recipe name/description set at session start
+ALL_STEPS          = []     # full ordered list of steps for context
 
 def set_current_step(step: str):
     global CURRENT_STEP, CURRENT_STEP_LABEL
     CURRENT_STEP = step
     CURRENT_STEP_LABEL = step
+
+def set_current_recipe(recipe: str, steps: list[str] = []):
+    global CURRENT_RECIPE, ALL_STEPS
+    CURRENT_RECIPE = recipe
+    ALL_STEPS = steps
 
 # Queues
 audio_queue         = queue.Queue()
@@ -412,7 +419,13 @@ def gpt_worker():
 
             try:
                 chunks = []
-                for chunk in speech_response(text, frame=frame):
+                for chunk in speech_response(
+                    text,
+                    frame=frame,
+                    recipe=CURRENT_RECIPE,
+                    current_step=CURRENT_STEP,
+                    all_steps=ALL_STEPS,
+                ):
                     print(chunk, end="", flush=True)
                     chunks.append(chunk)
                 print()
