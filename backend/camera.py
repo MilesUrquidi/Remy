@@ -8,16 +8,18 @@ import time
 import wave
 import ctypes
 import platform
-from chatgpt import ai_vision_audio_query, transcribe_audio
+import re as _re
+import json
+
+from chatgpt import vision_step_check, speech_response, transcribe_audio
 
 
-# --- Enable virtual cameras on macOS (Camo, OBS, etc.) ---
-# On macOS 12.3+, DAL plugin virtual cameras are hidden from AVFoundation
-# unless kCMIOHardwarePropertyAllowScreenCaptureDevices is set.
-# This MUST be called before any cv2.VideoCapture() to see Camo.
+# ---------------------------------------------------------------------------
+# macOS: expose DAL-plugin virtual cameras (Camo, OBS, etc.) to OpenCV
+# Must run before any cv2.VideoCapture()
+# ---------------------------------------------------------------------------
 
 def _enable_virtual_cameras():
-    """Allow macOS to expose DAL-plugin virtual cameras (Camo, OBS, etc.) to OpenCV."""
     if platform.system() != "Darwin":
         return
     try:
@@ -25,24 +27,21 @@ def _enable_virtual_cameras():
             "/System/Library/Frameworks/CoreMediaIO.framework/CoreMediaIO"
         )
 
-        kCMIOObjectSystemObject = 1
-
         class CMIOObjectPropertyAddress(ctypes.Structure):
             _fields_ = [
                 ("mSelector", ctypes.c_uint32),
-                ("mScope", ctypes.c_uint32),
-                ("mElement", ctypes.c_uint32),
+                ("mScope",    ctypes.c_uint32),
+                ("mElement",  ctypes.c_uint32),
             ]
 
-        # kCMIOHardwarePropertyAllowScreenCaptureDevices = 'aasc'
         prop = CMIOObjectPropertyAddress(
-            0x61617363,  # 'aasc'
-            0x676C6F62,  # 'glob' (kCMIOObjectPropertyScopeGlobal)
-            0x6D61696E,  # 'main' (kCMIOObjectPropertyElementMain)
+            0x61617363,  # 'aasc' kCMIOHardwarePropertyAllowScreenCaptureDevices
+            0x676C6F62,  # 'glob' kCMIOObjectPropertyScopeGlobal
+            0x6D61696E,  # 'main' kCMIOObjectPropertyElementMain
         )
         allow = ctypes.c_uint32(1)
         CoreMediaIO.CMIOObjectSetPropertyData(
-            ctypes.c_uint32(kCMIOObjectSystemObject),
+            ctypes.c_uint32(1),  # kCMIOObjectSystemObject
             ctypes.byref(prop),
             ctypes.c_uint32(0),
             None,
@@ -56,10 +55,12 @@ def _enable_virtual_cameras():
 _enable_virtual_cameras()
 
 
-# --- Device discovery ---
+# ---------------------------------------------------------------------------
+# Device discovery
+# ---------------------------------------------------------------------------
 
 def list_cameras(max_index=10):
-    """List available camera device indices (brute-force probe)."""
+    """List available camera device indices."""
     available = []
     for i in range(max_index):
         cap = cv2.VideoCapture(i)
@@ -69,45 +70,34 @@ def list_cameras(max_index=10):
     return available
 
 
-def find_camo_camera():
+def _get_avfoundation_names():
     """
-    Auto-detect the Camo virtual camera index by querying AVFoundation device names.
-    Returns (index, name) or None if not found.
-
-    Tries multiple methods:
-      1. Swift subprocess (macOS built-in, no extra deps)
-      2. ffmpeg AVFoundation enumeration (if ffmpeg is installed)
-
-    OpenCV has no device-name API, so we ask the OS directly.
+    Return an ordered list of AVFoundation video device names using Swift.
+    The list order matches the AVFoundation index (0, 1, 2, ...).
+    Returns [] on failure.
     """
-    import subprocess, re
+    import subprocess
 
-    # --- Method 1: Swift (always available on macOS) ---
+    # Enable DAL plugins in the Swift process too so Camo appears
     swift_code = r"""
 import CoreMediaIO
 import AVFoundation
 
-// Enable virtual cameras (DAL plugins like Camo)
 var prop = CMIOObjectPropertyAddress(
     mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
     mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
     mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
 )
 var allow: UInt32 = 1
-CMIOObjectSetPropertyData(
-    CMIOObjectID(kCMIOObjectSystemObject),
-    &prop, 0, nil,
-    UInt32(MemoryLayout<UInt32>.size), &allow
-)
+CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &prop, 0, nil,
+    UInt32(MemoryLayout<UInt32>.size), &allow)
 
 let devices = AVCaptureDevice.DiscoverySession(
     deviceTypes: [.builtInWideAngleCamera, .external],
     mediaType: .video,
     position: .unspecified
 ).devices
-for device in devices {
-    print(device.localizedName)
-}
+for device in devices { print(device.localizedName) }
 """
     try:
         proc = subprocess.run(
@@ -115,34 +105,76 @@ for device in devices {
             input=swift_code, capture_output=True, text=True, timeout=15,
         )
         names = [n.strip() for n in proc.stdout.strip().splitlines() if n.strip()]
-        for i, name in enumerate(names):
-            if "camo" in name.lower():
-                print(f"[Video] Swift found Camo camera: '{name}' (AVFoundation index {i})")
-                return i, name
-        if names:
-            print(f"[Video] Swift found cameras: {names} (no Camo)")
+        print(f"[Video] AVFoundation devices: {names}")
+        return names
     except Exception as e:
-        print(f"[Video] Swift device scan failed: {e}")
+        print(f"[Video] Swift scan failed: {e}")
+        return []
 
-    # --- Method 2: ffmpeg (if installed) ---
+
+def find_camo_camera():
+    """
+    Auto-detect the Camo virtual camera and return its OpenCV index.
+
+    The key problem: AVFoundation indices ≠ OpenCV indices.
+    Swift tells us the *name* order; OpenCV assigns indices by probe order.
+    On macOS, OpenCV probes in the same order as AVFoundation, so the
+    AVFoundation position maps directly to the OpenCV index — BUT only
+    after _enable_virtual_cameras() has already been called (done at import).
+
+    Strategy:
+      1. Get ordered AVFoundation names via Swift.
+      2. Find "camo" in that list → that position is the OpenCV index.
+      3. Verify by opening that OpenCV index and confirming it works.
+      4. Fallback: if Swift fails, try ffmpeg for the index directly.
+
+    Returns (opencv_index, name) or None.
+    """
+    import subprocess
+
+    # --- Method 1: Swift name list → position = OpenCV index ---
+    names = _get_avfoundation_names()
+    for av_index, name in enumerate(names):
+        if "camo" in name.lower():
+            # Verify this index actually opens in OpenCV
+            cap = cv2.VideoCapture(av_index)
+            if cap.isOpened():
+                cap.release()
+                print(f"[Video] Camo confirmed at OpenCV index {av_index} ('{name}')")
+                return av_index, name
+            else:
+                # Index mismatch — scan all OpenCV indices and return the
+                # first non-zero one that opens (Camo is never index 0)
+                print(f"[Video] AVFoundation index {av_index} didn't open in OpenCV, scanning...")
+                for cv_index in range(1, 10):
+                    cap = cv2.VideoCapture(cv_index)
+                    if cap.isOpened():
+                        cap.release()
+                        print(f"[Video] Using OpenCV index {cv_index} for Camo '{name}'")
+                        return cv_index, name
+                cap.release()
+
+    # --- Method 2: ffmpeg (gives AVFoundation indices directly) ---
     try:
         proc = subprocess.run(
             ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             capture_output=True, text=True, timeout=5,
         )
-        in_video_section = False
+        in_video = False
         for line in proc.stderr.splitlines():
             if "AVFoundation video devices" in line:
-                in_video_section = True
+                in_video = True
                 continue
             if "AVFoundation audio devices" in line:
                 break
-            if in_video_section:
-                m = re.search(r'\[(\d+)\]\s+(.+)', line)
+            if in_video:
+                m = _re.search(r'\[(\d+)\]\s+(.+)', line)
                 if m and "camo" in m.group(2).lower():
-                    return int(m.group(1)), m.group(2).strip()
+                    idx, name = int(m.group(1)), m.group(2).strip()
+                    print(f"[Video] ffmpeg found Camo: '{name}' at index {idx}")
+                    return idx, name
     except Exception as e:
-        print(f"[Video] ffmpeg device scan failed: {e}")
+        print(f"[Video] ffmpeg scan failed: {e}")
 
     return None
 
@@ -150,12 +182,11 @@ for device in devices {
 def list_audio_devices():
     """List available audio input devices."""
     devices = sd.query_devices()
-    inputs = [
+    return [
         (i, d["name"], int(d["max_input_channels"]))
         for i, d in enumerate(devices)
         if d["max_input_channels"] > 0
     ]
-    return inputs
 
 
 def find_camo_audio_device():
@@ -166,71 +197,63 @@ def find_camo_audio_device():
     return None
 
 
-# --- Audio capture (runs in its own thread) ---
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-SAMPLE_RATE    = 16000  # 16kHz is ideal for speech recognition
-CHANNELS       = 1
-AUDIO_CHUNK    = 1024
+SAMPLE_RATE   = 16000   # Hz — optimal for Whisper
+CHANNELS      = 1
+AUDIO_CHUNK   = 1024
 
-# VAD settings
-SILENCE_THRESHOLD  = 0.02  # RMS below this is silence (float32 audio, range 0-1)
-SILENCE_DURATION   = 0.8   # seconds of silence that marks end of utterance
-MIN_SPEECH_SECONDS = 0.5   # discard clips shorter than this (noise/clicks)
+# VAD
+SILENCE_THRESHOLD  = 0.02   # RMS below this = silence
+SILENCE_DURATION   = 0.4    # seconds of silence = end of utterance (snappy)
+MIN_SPEECH_SECONDS = 0.3    # discard clips shorter than this
 
-# Periodic video analysis
-VIDEO_INTERVAL = 1  # seconds between video-only GPT snapshots
+# Video analysis
+VIDEO_INTERVAL = 1  # seconds between passive step checks
 
 
-# Updated by set_current_step() as the user progresses through a recipe
-VIDEO_PROMPT       = "You are seeing a previous frame and a current frame. In one sentence, describe what changed between the two frames in terms of food preparation."
-CURRENT_STEP_LABEL = None  # human-readable label printed in terminal during testing
+# ---------------------------------------------------------------------------
+# Pipeline state
+# ---------------------------------------------------------------------------
+
+# Set by set_current_step() as the user progresses
+CURRENT_STEP       = None   # step text passed to vision_step_check
+CURRENT_STEP_LABEL = None   # same value, kept as alias for clarity
 
 def set_current_step(step: str):
-    """Update the VIDEO_PROMPT to check for the current recipe step using two-frame comparison."""
-    global VIDEO_PROMPT, CURRENT_STEP_LABEL
+    global CURRENT_STEP, CURRENT_STEP_LABEL
+    CURRENT_STEP = step
     CURRENT_STEP_LABEL = step
-    VIDEO_PROMPT = (
-        f'You are a precise recipe vision assistant analyzing two frames from a live camera feed.\n'
-        f'The current recipe step to verify is: "{step}"\n\n'
-        f'Examine both the previous frame and the current frame carefully, then return ONLY a raw JSON object '
-        f'with exactly this structure (no markdown, no explanation outside the JSON):\n'
-        f'{{\n'
-        f'  "completed": <true if state.completed OR action.completed is true, otherwise false>,\n'
-        f'  "state": {{"completed": <true if the result of the step is clearly visible in the current frame>, "explanation": "<one sentence describing what you see in the current frame>"}},\n'
-        f'  "action": {{"completed": <true if a visible change occurred between the two frames that completes this step>, "explanation": "<one sentence describing what changed between the frames>"}}\n'
-        f'}}\n\n'
-        f'Rules:\n'
-        f'- completed is true if state.completed OR action.completed is true\n'
-        f'- Be strict: only mark completed true if you are clearly sure\n'
-        f'- Keep explanations to one short sentence each\n'
-        f'- Return raw JSON only, no markdown code blocks'
-    )
 
-
+# Queues
 audio_queue         = queue.Queue()
-transcription_queue = queue.Queue()   # raw audio buffers ready to transcribe
+transcription_queue = queue.Queue()   # raw audio buffers → transcribe_worker
+speech_queue        = queue.Queue()   # (text, frame, step_label) → gpt_worker (priority)
+video_check_queue   = queue.Queue(maxsize=1)  # latest frame only, old dropped
+results_queue       = queue.Queue()   # parsed AI results → SSE stream
 
-# Two separate input queues for gpt_worker:
-#   video_check_queue  — holds AT MOST ONE item (latest frame wins, old one dropped)
-#   speech_queue       — holds all speech utterances in order (never dropped)
-# This prevents the video queue from growing when GPT is slower than VIDEO_INTERVAL.
-video_check_queue   = queue.Queue(maxsize=1)
-speech_queue        = queue.Queue()
-
-results_queue       = queue.Queue()   # parsed AI results pushed to SSE stream
 audio_running       = threading.Event()
 
-# Shared latest video frame — updated every frame by the main loop
-latest_frame      = None
-latest_frame_lock = threading.Lock()
+# Shared latest frame
+latest_frame        = None
+latest_frame_lock   = threading.Lock()
 
-# VU meter level — updated by the audio thread, read by the main loop
+# Previous frame for two-frame step checks
+_prev_frame_lock    = threading.Lock()
+_prev_frame         = None
+
+# VU meter
 vu_level      = 0.0
 vu_level_lock = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Audio capture + VAD
+# ---------------------------------------------------------------------------
+
 def audio_callback(indata, frames, time, status):
-    """Called by sounddevice for each audio chunk."""
     if status:
         print(f"[Audio] {status}")
     audio_queue.put(indata.copy())
@@ -238,8 +261,7 @@ def audio_callback(indata, frames, time, status):
 
 def start_audio_stream(device_index):
     """Capture audio with VAD — emit complete utterances when the user stops talking."""
-    audio_running.set()
-    print(f"[Audio] Streaming from device index {device_index}")
+    print(f"[Audio] Streaming from device {device_index}")
 
     speech_buffer  = []
     silence_count  = 0
@@ -262,7 +284,6 @@ def start_audio_stream(device_index):
 
             rms = float(np.sqrt(np.mean(chunk ** 2)))
 
-            # Update VU meter for the main video loop
             with vu_level_lock:
                 global vu_level
                 vu_level = rms
@@ -278,11 +299,10 @@ def start_audio_stream(device_index):
                     speech_buffer.append(chunk)
                     silence_count += 1
                     if silence_count >= silence_limit:
-                        # User stopped talking — ship the utterance
                         if len(speech_buffer) >= min_speech_chunks:
                             audio_data = np.concatenate(speech_buffer, axis=0)
                             transcription_queue.put(audio_data.copy())
-                            print("[Audio] Utterance complete, queued for transcription.")
+                            print("[Audio] Utterance queued for transcription.")
                         speech_buffer = []
                         silence_count = 0
                         is_speaking   = False
@@ -290,174 +310,209 @@ def start_audio_stream(device_index):
     print("[Audio] Stream stopped.")
 
 
+# ---------------------------------------------------------------------------
+# Transcription worker — Whisper + wake word filter
+# ---------------------------------------------------------------------------
+
+_WAKE_WORD = "remy"
+
 def transcribe_worker():
-    """Continuously pull audio buffers, transcribe via Whisper, then queue for GPT."""
+    """Transcribe audio buffers via Whisper, then forward to gpt_worker only if wake word heard."""
     while audio_running.is_set() or not transcription_queue.empty():
         try:
             audio_data = transcription_queue.get(timeout=1)
         except queue.Empty:
             continue
 
-        # Convert numpy float32 → 16-bit PCM WAV in memory
         pcm = (audio_data * 32767).astype(np.int16)
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, "wb") as wf:
             wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(pcm.tobytes())
 
         try:
             text = transcribe_audio(wav_buffer)
-            if text:
-                print(f"[Transcript] {text}")
-                with latest_frame_lock:
-                    frame_copy = latest_frame.copy() if latest_frame is not None else None
-                speech_queue.put((text, frame_copy, True, CURRENT_STEP_LABEL))
+            if not text:
+                continue
+
+            print(f"[Transcript] {text}")
+
+            # Wake word filter — only respond when user says "remy"
+            if _WAKE_WORD not in text.lower():
+                print("[Wake] No wake word — skipping.")
+                continue
+
+            with latest_frame_lock:
+                frame_copy = latest_frame.copy() if latest_frame is not None else None
+
+            speech_queue.put((text, frame_copy, CURRENT_STEP_LABEL))
+
         except Exception as e:
             print(f"[Transcript] Whisper error: {e}")
 
 
-# --- Periodic video worker ---
+# ---------------------------------------------------------------------------
+# Periodic video worker
+# ---------------------------------------------------------------------------
 
 def video_worker():
-    """Send the latest frame to GPT every VIDEO_INTERVAL seconds for passive step analysis."""
+    """Push latest frame to video_check_queue every VIDEO_INTERVAL seconds."""
     while audio_running.is_set():
         time.sleep(VIDEO_INTERVAL)
+
         with latest_frame_lock:
             frame_copy = latest_frame.copy() if latest_frame is not None else None
-        if frame_copy is not None:
-            # Discard any stale pending video check and replace with the freshest frame.
-            # This keeps the queue at most 1 item so GPT never falls behind.
+
+        if frame_copy is not None and CURRENT_STEP:
+            # Replace any stale pending check with the freshest frame
             try:
                 video_check_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                video_check_queue.put_nowait((VIDEO_PROMPT, frame_copy, False, CURRENT_STEP_LABEL))
+                video_check_queue.put_nowait((frame_copy, CURRENT_STEP_LABEL))
             except queue.Full:
-                pass  # shouldn't happen after the drain above
+                pass
 
 
-# --- GPT worker ---
+# ---------------------------------------------------------------------------
+# GPT worker
+# ---------------------------------------------------------------------------
 
-def gpt_worker(system_prompt=None):
-    """Pull items from speech_queue (priority) or video_check_queue and send to GPT-4o."""
-    import json
+def gpt_worker():
+    """
+    Process speech (priority) and video check items through GPT.
 
+    Speech items  → speech_response()   → conversational reply → SSE "speech" event
+    Video items   → vision_step_check() → JSON step check      → SSE "step_check" event
+    """
     while audio_running.is_set() or not speech_queue.empty():
-        # Speech has priority — process immediately if anything is waiting
+        # Speech has priority
         item = None
+        is_speech = False
         try:
             item = speech_queue.get_nowait()
+            is_speech = True
         except queue.Empty:
-            # Nothing spoken — try the latest video check (0.5 s wait max)
             try:
                 item = video_check_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-        text, frame, remember, step_label = item
+        if not audio_running.is_set():
+            # Pipeline stopping — discard in-flight items
+            continue
 
-        # Print a clean label so it's easy to read during testing
-        if not remember:
-            print(f"\n[Step Check] '{step_label or 'general observation'}'")
-            print(f"[AI] ", end="", flush=True)
-        else:
+        if is_speech:
+            text, frame, step_label = item
             print(f"\n[You said] '{text}'")
-            print(f"[AI] ", end="", flush=True)
+            print("[Remy] ", end="", flush=True)
 
-        try:
-            chunks = []
-            for chunk in ai_vision_audio_query(
-                text, frame=frame, system_prompt=system_prompt, stream=True, remember=remember
-            ):
-                print(chunk, end="", flush=True)
-                chunks.append(chunk)
-            print()
+            try:
+                chunks = []
+                for chunk in speech_response(text, frame=frame):
+                    print(chunk, end="", flush=True)
+                    chunks.append(chunk)
+                print()
 
-            full = "".join(chunks)
+                if not audio_running.is_set():
+                    continue
 
-            # If the pipeline was stopped while this call was in-flight, discard the result
-            # so stale data never reaches the frontend SSE stream.
-            if not audio_running.is_set():
-                print("\n[GPT] Pipeline stopped — discarding in-flight result.")
+                results_queue.put({
+                    "type":  "speech",
+                    "step":  step_label,
+                    "data":  "".join(chunks),
+                })
+            except Exception as e:
+                print(f"[GPT speech] Error: {e}")
+
+        else:
+            frame, step_label = item
+            print(f"\n[Step Check] '{step_label or 'no step set'}'")
+
+            if not CURRENT_STEP:
                 continue
 
-            # Push result to SSE queue for the frontend
-            if not remember:
-                # Step check — try to parse as JSON.
-                # GPT sometimes wraps the response in ```json ... ``` markdown fences;
-                # strip those before parsing so we always get a dict.
-                import re as _re
-                clean = _re.sub(r"^```(?:json)?\s*", "", full.strip(), flags=_re.IGNORECASE)
+            with _prev_frame_lock:
+                global _prev_frame
+                prev = _prev_frame.copy() if _prev_frame is not None else None
+                _prev_frame = frame.copy()
+
+            try:
+                raw = vision_step_check(CURRENT_STEP, frame, previous_frame=prev)
+                print(f"[AI] {raw}")
+
+                if not audio_running.is_set():
+                    continue
+
+                # Strip markdown fences if GPT wrapped the JSON anyway
+                clean = _re.sub(r"^```(?:json)?\s*", "", raw, flags=_re.IGNORECASE)
                 clean = _re.sub(r"\s*```$", "", clean.strip())
+
                 try:
                     data = json.loads(clean)
                 except json.JSONDecodeError:
-                    data = full
+                    # Non-JSON response — discard, don't bleed into speech channel
+                    print("[Step Check] Non-JSON response discarded.")
+                    continue
+
                 results_queue.put({
                     "type": "step_check",
                     "step": step_label,
                     "data": data,
                 })
-            else:
-                # Speech response
-                results_queue.put({
-                    "type": "speech",
-                    "step": step_label,
-                    "data": full,
-                })
-
-        except Exception as e:
-            print(f"[GPT] Error: {e}")
+            except Exception as e:
+                print(f"[GPT video] Error: {e}")
 
 
-# --- Main feed ---
+# ---------------------------------------------------------------------------
+# Main pipeline entry point
+# ---------------------------------------------------------------------------
 
-def get_camo_feed(camera_index=None, audio_device_index=None, system_prompt=None):
+def get_camo_feed(camera_index=None, audio_device_index=None):
     """
-    Capture video + audio from Camo (phone streamed to Mac).
-    Transcribes speech, pairs it with the latest video frame, and sends
-    both to GPT-4o for real-time analysis.
+    Start video + audio pipeline.
 
     Args:
         camera_index:       Video device index. Auto-detected if None.
         audio_device_index: Audio device index. Auto-detected if None.
-        system_prompt:      Optional system message passed to GPT-4o on every call.
-
-    Press 'q' to quit.
     """
+    global latest_frame, _prev_frame
 
     # --- Video setup ---
     if camera_index is None:
         camo = find_camo_camera()
         if camo:
             camera_index, cam_name = camo
-            print(f"[Video] Found Camo camera: '{cam_name}' (index {camera_index})")
+            print(f"[Video] Using Camo: '{cam_name}' (OpenCV index {camera_index})")
         else:
+            # Camo not found — list what's available and pick the first non-builtin.
+            # Never silently fall back to index 0 (FaceTime/built-in) if there's
+            # another camera present, since that's almost certainly not what we want.
             cameras = list_cameras()
-            print(f"[Video] Available camera indices: {cameras}")
+            print(f"[Video] Camo not found. Available OpenCV indices: {cameras}")
             if not cameras:
-                print("[Video] No cameras found. Is Camo connected?")
+                print("[Video] No cameras found. Is Camo running on your phone?")
                 return
-            # Skip index 0 (built-in FaceTime) if there's another camera
             non_builtin = [i for i in cameras if i != 0]
             if non_builtin:
-                camera_index = non_builtin[-1]
-                print(f"[Video] Skipping built-in camera, using index: {camera_index}")
+                camera_index = non_builtin[0]  # first non-FaceTime camera
+                print(f"[Video] Using first non-builtin camera at index {camera_index}")
             else:
-                camera_index = cameras[-1]
-                print(f"[Video] Only built-in camera found, using index: {camera_index}")
+                # Only the built-in camera is available — use it with a warning
+                camera_index = 0
+                print("[Video] WARNING: Only built-in (FaceTime) camera found. Is Camo connected?")
     else:
         print(f"[Video] Using manually specified camera index: {camera_index}")
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print(f"[Video] Failed to open camera at index {camera_index}")
+        print(f"[Video] Failed to open camera {camera_index}")
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     # --- Audio setup ---
@@ -465,67 +520,48 @@ def get_camo_feed(camera_index=None, audio_device_index=None, system_prompt=None
         result = find_camo_audio_device()
         if result:
             audio_device_index, name, _ = result
-            print(f"[Audio] Found Camo Microphone: '{name}' (index {audio_device_index})")
+            print(f"[Audio] Found Camo Mic: '{name}' (index {audio_device_index})")
         else:
-            print("[Audio] Camo Microphone not found. Available input devices:")
+            print("[Audio] Camo Mic not found. Available inputs:")
             for idx, name, ch in list_audio_devices():
                 print(f"  [{idx}] {name} ({ch} ch)")
-            print("[Audio] Continuing without audio. Pass audio_device_index= to enable.")
+            print("[Audio] Continuing without audio.")
 
-    # Start audio + transcription + GPT threads
-    audio_running.set()  # Always set so the video loop runs
+    # --- Start workers ---
+    audio_running.set()
+    _prev_frame = None
 
-    # Video analysis + GPT always run (they don't need audio)
-    video_thread = threading.Thread(
-        target=video_worker,
-        daemon=True,
-    )
-    gpt_thread = threading.Thread(
-        target=gpt_worker,
-        kwargs={"system_prompt": system_prompt},
-        daemon=True,
-    )
+    video_thread = threading.Thread(target=video_worker, daemon=True)
+    gpt_thread   = threading.Thread(target=gpt_worker,   daemon=True)
     video_thread.start()
     gpt_thread.start()
 
-    # Audio + transcription only if a microphone is available
     if audio_device_index is not None:
-        audio_thread = threading.Thread(
-            target=start_audio_stream,
-            args=(audio_device_index,),
-            daemon=True,
-        )
-        transcribe_thread = threading.Thread(
-            target=transcribe_worker,
-            daemon=True,
-        )
+        audio_thread    = threading.Thread(target=start_audio_stream, args=(audio_device_index,), daemon=True)
+        transcribe_thread = threading.Thread(target=transcribe_worker, daemon=True)
         audio_thread.start()
         transcribe_thread.start()
 
-    print(f"[Feed] Started — VAD active, video snapshot every {VIDEO_INTERVAL}s.\n")
+    print(f"[Feed] Started — wake word '{_WAKE_WORD}', VAD silence={SILENCE_DURATION}s, video every {VIDEO_INTERVAL}s.")
 
     while audio_running.is_set():
         ret, frame = cap.read()
         if not ret:
             print("[Video] Failed to read frame.")
             break
-
-        # Keep latest frame available for GPT worker and MJPEG stream
         with latest_frame_lock:
-            global latest_frame
             latest_frame = frame.copy()
 
-    # Cleanup
     audio_running.clear()
     cap.release()
+    print("[Feed] Stopped.")
 
 
 # ---------------------------------------------------------------------------
-# MJPEG helper — called by the FastAPI /camera/feed endpoint
+# MJPEG helper
 # ---------------------------------------------------------------------------
 
 def get_latest_frame_jpeg(quality: int = 70) -> bytes | None:
-    """Return the latest camera frame encoded as JPEG bytes, or None if not ready."""
     with latest_frame_lock:
         frame = latest_frame.copy() if latest_frame is not None else None
     if frame is None:
@@ -534,8 +570,11 @@ def get_latest_frame_jpeg(quality: int = 70) -> bytes | None:
     return buf.tobytes()
 
 
+# ---------------------------------------------------------------------------
+# Pipeline shutdown
+# ---------------------------------------------------------------------------
+
 def _flush_queue(q: queue.Queue):
-    """Empty a queue without blocking."""
     while not q.empty():
         try:
             q.get_nowait()
@@ -544,18 +583,11 @@ def _flush_queue(q: queue.Queue):
 
 
 def stop_pipeline():
-    """
-    Immediately stop all pipeline workers and flush every queue.
-    Call this instead of audio_running.clear() directly so that
-    gpt_worker / transcribe_worker exit right away rather than
-    draining stale items.
-    """
+    """Stop all workers and flush all queues immediately."""
     audio_running.clear()
     _flush_queue(audio_queue)
     _flush_queue(transcription_queue)
     _flush_queue(video_check_queue)
     _flush_queue(speech_queue)
     _flush_queue(results_queue)
-    print("[Pipeline] Stopped and all queues flushed.")
-
-
+    print("[Pipeline] Stopped and queues flushed.")

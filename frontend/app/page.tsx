@@ -73,10 +73,17 @@ export default function Home() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleNextRef = useRef<() => Promise<void>>(async () => {});
   const currentStepLabelRef = useRef<string>("");
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Cleanup SSE on unmount
+  // Cleanup SSE and audio on unmount
   useEffect(() => {
-    return () => { eventSourceRef.current?.close(); };
+    return () => {
+      eventSourceRef.current?.close();
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
   }, []);
 
   // Keep handleNextRef pointing at the latest handleNext closure
@@ -100,6 +107,35 @@ export default function Home() {
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stepCompleted]);
+
+  // ── TTS playback — stop-and-replace on new speech ──────────────
+
+  async function speak(text: string) {
+    // Stop whatever is currently playing immediately
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
+      audioRef.current = null;
+    }
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice: "onyx" }),
+      });
+      if (!res.ok) return;
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.play();
+      audio.onended = () => URL.revokeObjectURL(url);
+    } catch {
+      // TTS failure is non-fatal — text is still displayed
+    }
+  }
 
   // ── SSE connection ─────────────────────────────────────────────
 
@@ -135,6 +171,7 @@ export default function Home() {
           // Ignore JSON responses — these are step-check bleed from false VAD triggers
           if (!text.startsWith("{") && !text.startsWith("```")) {
             setRemySpeech(text);
+            speak(text);
           }
         }
       } catch {
@@ -258,6 +295,7 @@ export default function Home() {
 
   async function handleEndRecipe() {
     eventSourceRef.current?.close();
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
     setCameraActive(false);
     setShowCompletionOverlay(false);
     try { await fetch(`${BACKEND_URL}/camera/stop`, { method: "POST" }); } catch {}

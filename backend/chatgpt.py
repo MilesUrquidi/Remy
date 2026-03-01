@@ -7,34 +7,75 @@ load_dotenv()
 
 client = OpenAI()
 
-# Rolling conversation history — text only (images are not stored to save tokens)
-# Each entry is {"role": "user"|"assistant", "content": str}
+# ---------------------------------------------------------------------------
+# Conversation history — speech only (step checks never go into history)
+# ---------------------------------------------------------------------------
+
 conversation_history = []
 MAX_HISTORY = 20  # max messages kept (= 10 back-and-forth exchanges)
 
-# The last frame sent to GPT — included as "previous frame" in every subsequent call
+# The last frame sent — included as "previous frame" in every call with vision
 _previous_frame = None
 
 
-def ai_text_output(prompt):
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
-    print(response.choices[0].message.content)
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
+# Used by vision_step_check() — expects strict JSON back, no chat
+_STEP_CHECK_SYSTEM = (
+    "You are a precise recipe vision assistant. "
+    "You analyze two camera frames and return ONLY a raw JSON object. "
+    "No markdown, no explanation, no text outside the JSON. "
+    "Be strict: only mark completed true when the step result is clearly visible."
+)
+
+# Used by speech_response() — friendly conversational assistant
+_SPEECH_SYSTEM = (
+    "You are Remy, an expert AI cooking assistant inspired by the rat from Ratatouille. "
+    "You are watching the user cook via camera and coaching them through a recipe in real time.\n\n"
+    "Rules:\n"
+    "- Answer in 1-2 sentences. Be direct.\n"
+    "- Never start with 'Great!', 'Sure!', 'Of course!', 'Absolutely!' or any filler affirmation.\n"
+    "- If you can see the camera frame, use it — describe what you actually see and base your answer on it.\n"
+    "- If they ask 'does this look right?', give a real honest answer based on the frame.\n"
+    "- Match their energy: quick question = quick answer. Detailed question = more detail.\n"
+    "- Occasional warmth and encouragement is fine, but never sycophantic.\n"
+    "- Never respond with JSON — always respond in natural language."
+)
 
 
-def transcribe_audio(wav_buffer):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _encode_frame(frame) -> str:
+    """Encode a cv2 BGR frame to a base64 JPEG string."""
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return base64.b64encode(buf).decode("utf-8")
+
+
+def _append_history(user_text: str, assistant_text: str):
+    """Append an exchange to conversation_history and trim to MAX_HISTORY."""
+    conversation_history.append({"role": "user", "content": user_text})
+    conversation_history.append({"role": "assistant", "content": assistant_text})
+    if len(conversation_history) > MAX_HISTORY:
+        del conversation_history[:2]
+
+
+# ---------------------------------------------------------------------------
+# Speech transcription
+# ---------------------------------------------------------------------------
+
+def transcribe_audio(wav_buffer) -> str:
     """
     Transcribe a WAV audio buffer using OpenAI Whisper API.
 
     Args:
-        wav_buffer: BytesIO object containing a valid WAV file.
+        wav_buffer: BytesIO containing a valid WAV file.
 
     Returns:
-        str: Transcribed text, or empty string if nothing detected.
+        Transcribed text, or empty string if nothing detected.
     """
     wav_buffer.seek(0)
     transcript = client.audio.transcriptions.create(
@@ -44,100 +85,107 @@ def transcribe_audio(wav_buffer):
     return transcript.text.strip()
 
 
-def _encode_frame(frame):
-    """Encode a cv2 BGR frame to a base64 JPEG string."""
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-    return base64.b64encode(buf).decode("utf-8")
+# ---------------------------------------------------------------------------
+# Vision step check  —  JSON only, never enters conversation history
+# ---------------------------------------------------------------------------
 
-
-def ai_vision_audio_query(text_prompt, frame=None, system_prompt=None, stream=False, remember=True):
+def vision_step_check(step: str, frame, previous_frame=None) -> str:
     """
-    Send transcribed speech + an optional video frame to GPT-4o,
-    with rolling conversation history for context.
+    Analyze one or two camera frames and return a raw JSON step-check result.
 
     Args:
-        text_prompt:   Transcribed speech or any text query.
-        frame:         Optional numpy BGR array (cv2 frame) to include as image context.
-        system_prompt: Optional system message to set model behaviour.
-        stream:        If True, yields response text chunks; otherwise returns full string.
-        remember:      If True, appends this exchange to conversation history.
-                       Set False for passive video-only snapshots so they don't
-                       pollute the conversational context.
+        step:           The current recipe step to verify.
+        frame:          Current cv2 BGR frame.
+        previous_frame: Previous cv2 BGR frame (or None for first check).
 
     Returns:
-        str (stream=False) or generator of str chunks (stream=True).
+        Raw JSON string from GPT (caller is responsible for parsing).
     """
-    messages = []
+    prompt = (
+        f'The current recipe step to verify is: "{step}"\n\n'
+        f'Examine the frame(s) and return ONLY a raw JSON object with this structure:\n'
+        f'{{\n'
+        f'  "completed": <true if state.completed OR action.completed is true>,\n'
+        f'  "state": {{"completed": <bool>, "explanation": "<one sentence>"}},\n'
+        f'  "action": {{"completed": <bool>, "explanation": "<one sentence>"}}\n'
+        f'}}\n\n'
+        f'Rules:\n'
+        f'- completed is true only if state.completed OR action.completed is true\n'
+        f'- Be strict: only mark completed true if clearly visible\n'
+        f'- Return raw JSON only, no markdown code blocks'
+    )
 
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-
-    # Inject prior conversation (text-only — images not stored to save tokens)
-    messages.extend(conversation_history)
-
-    # Build the current user message
-    if frame is not None:
-        global _previous_frame
-        content = []
-
-        # Include previous frame first so GPT can see the transition
-        if _previous_frame is not None:
-            content.append({"type": "text", "text": "Previous frame:"})
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{_encode_frame(_previous_frame)}",
-                    "detail": "low",
-                },
-            })
-
-        content.append({"type": "text", "text": "Current frame:"})
+    content = []
+    if previous_frame is not None:
+        content.append({"type": "text", "text": "Previous frame:"})
         content.append({
             "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{_encode_frame(frame)}",
-                "detail": "low",
-            },
+            "image_url": {"url": f"data:image/jpeg;base64,{_encode_frame(previous_frame)}", "detail": "low"},
         })
-        content.append({"type": "text", "text": text_prompt})
+    content.append({"type": "text", "text": "Current frame:"})
+    content.append({
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{_encode_frame(frame)}", "detail": "low"},
+    })
+    content.append({"type": "text", "text": prompt})
 
-        _previous_frame = frame.copy()
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": _STEP_CHECK_SYSTEM},
+            {"role": "user", "content": content},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ---------------------------------------------------------------------------
+# Speech response  —  conversational, updates history, streams
+# ---------------------------------------------------------------------------
+
+def speech_response(user_text: str, frame=None):
+    """
+    Respond to what the user said. Streams response chunks.
+    Adds the exchange to conversation history.
+
+    Args:
+        user_text: Transcribed speech from the user.
+        frame:     Optional current cv2 BGR frame for visual context.
+
+    Yields:
+        str chunks of the assistant response.
+    """
+    messages = [{"role": "system", "content": _SPEECH_SYSTEM}]
+    messages.extend(conversation_history)
+
+    if frame is not None:
+        content = [
+            {"type": "text", "text": "Current frame:"},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{_encode_frame(frame)}", "detail": "low"},
+            },
+            {"type": "text", "text": user_text},
+        ]
     else:
-        content = text_prompt
+        content = user_text
 
     messages.append({"role": "user", "content": content})
 
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=messages,
-        stream=stream,
+        stream=True,
     )
 
-    if stream:
-        def _gen():
-            full_response = []
-            for chunk in response:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    full_response.append(delta)
-                    yield delta
-            if remember:
-                _append_history(text_prompt, "".join(full_response))
-        return _gen()
-    else:
-        result = response.choices[0].message.content
-        if remember:
-            _append_history(text_prompt, result)
-        return result
+    full_response = []
+    for chunk in response:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            full_response.append(delta)
+            yield delta
 
-
-def _append_history(user_text, assistant_text):
-    """Append an exchange to conversation_history and trim to MAX_HISTORY."""
-    conversation_history.append({"role": "user", "content": user_text})
-    conversation_history.append({"role": "assistant", "content": assistant_text})
-    if len(conversation_history) > MAX_HISTORY:
-        # Drop oldest pair to stay within the window
-        del conversation_history[:2]
+    _append_history(user_text, "".join(full_response))
 
 
 # ---------------------------------------------------------------------------
@@ -157,38 +205,14 @@ Rules for every step:
 Return ONLY a raw JSON array of strings. No markdown, no explanation, no extra keys."""
 
 _TASK_DECOMP_EXAMPLES = [
-    {
-        "role": "user",
-        "content": "Task: Make a peanut butter and jelly sandwich"
-    },
-    {
-        "role": "assistant",
-        "content": '["Two slices of bread are laid flat on a surface", "Peanut butter is spread across one slice", "Jelly is spread across the other slice", "Both slices are pressed together face-down"]'
-    },
-    {
-        "role": "user",
-        "content": "Task: Make iced coffee"
-    },
-    {
-        "role": "assistant",
-        "content": '["A glass is placed on a flat surface", "Glass is filled with ice cubes", "Coffee is poured over the ice", "Milk or creamer is added to the glass", "Drink is stirred with a spoon"]'
-    },
-    {
-        "role": "user",
-        "content": "Task: Make a bowl of cereal"
-    },
-    {
-        "role": "assistant",
-        "content": '["A bowl is placed on a flat surface", "Cereal is poured into the bowl", "Milk is poured over the cereal"]'
-    },
-    {
-        "role": "user",
-        "content": "Task: Make avocado toast"
-    },
-    {
-        "role": "assistant",
-        "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "Avocado is scooped and spread across the toast", "Salt and pepper are sprinkled on top"]'
-    },
+    {"role": "user", "content": "Task: Make a peanut butter and jelly sandwich"},
+    {"role": "assistant", "content": '["Two slices of bread are laid flat on a surface", "Peanut butter is spread across one slice", "Jelly is spread across the other slice", "Both slices are pressed together face-down"]'},
+    {"role": "user", "content": "Task: Make iced coffee"},
+    {"role": "assistant", "content": '["A glass is placed on a flat surface", "Glass is filled with ice cubes", "Coffee is poured over the ice", "Milk or creamer is added to the glass", "Drink is stirred with a spoon"]'},
+    {"role": "user", "content": "Task: Make a bowl of cereal"},
+    {"role": "assistant", "content": '["A bowl is placed on a flat surface", "Cereal is poured into the bowl", "Milk is poured over the cereal"]'},
+    {"role": "user", "content": "Task: Make avocado toast"},
+    {"role": "assistant", "content": '["A slice of bread is placed on a flat surface", "Bread is toasted and placed back on the surface", "Avocado is scooped and spread across the toast", "Salt and pepper are sprinkled on top"]'},
 ]
 
 
@@ -196,12 +220,8 @@ def generate_task_steps(task: str) -> list[str]:
     """
     Break a physical task into a list of frame-verifiable steps using GPT.
 
-    Args:
-        task: Natural language description of the task (e.g. "do a squat").
-
     Returns:
-        List of step strings in order, e.g.:
-        ["Stand with feet shoulder-width apart", "Lower hips to parallel", ...]
+        List of step strings in order.
     """
     import json
 
@@ -212,7 +232,7 @@ def generate_task_steps(task: str) -> list[str]:
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=messages,
-        temperature=0.3,  # low temp = consistent, structured output
+        temperature=0.3,
     )
 
     raw = response.choices[0].message.content.strip()
